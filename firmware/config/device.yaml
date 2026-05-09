@@ -1,0 +1,85 @@
+# 设备参数配置
+
+# ESP32-S3 具体型号（根据采购型号填写）
+device:
+  model: "ESP32-S3-N8R8"      # Flash 8MB, PSRAM 8MB
+  revision: "v1.0"
+  mac_address: ""                # 留空，自动读取
+
+# 引脚分配（根据硬件设计填写）
+pins:
+  i2s:
+    bck: 26
+    ws: 25
+    data_in: 35
+    data_out: -1                 # 未使用
+  led:
+    gpio: 2                      # 大多数 S3 开发板有板载 LED
+    active_high: true
+  button:
+    gpio: 0                      # BOOT 按钮
+    active_low: true
+  battery:
+    adc_pin: 36                  # VP 引脚
+    adc_channel: 0
+  sd_card:
+    mosi: 11
+    miso: 12
+    sclk: 13
+    cs: 10
+
+# 电源管理
+power:
+  vbat_pin: 36                  # 电池电压检测引脚
+  vbat_divider: 2.0             # 分压比
+  vbat_full: 4.2                 # 满电电压
+  vbat_empty: 3.3               # 空电电压
+  low_power_mode: true           # 是否启用低功耗
+  deepsleep_current_ua: 10       # DeepSleep 电流（微安）
+
+# 时钟频率
+clock:
+  cpu_freq_mhz: 240
+  xtal_freq_mhz: 40
+
+# Flash 配置
+flash:
+  size: "8MB"
+  mode: "qio"
+  speed: "80MHz"
+
+# PSRAM 配置
+psram:
+  enabled: true
+  size: "8MB"
+  speed: "80MHz"
+
+# 串口配置（用于调试）
+uart:
+  tx_pin: 43
+  rx_pin: 44
+  baud_rate: 115200
+
+# I2C 配置（未来扩展：外设）
+i2c:
+  enabled: false
+  sda_pin: 8
+  scl_pin: 9
+  freq_hz: 100000
+
+# SPI 配置（SD 卡）
+spi:
+  host: "SPI2_HOST"
+  dma_chan: 1
+
+# 看门狗配置
+watchdog:
+  timeout_sec: 30                # 30 秒无响应则复位
+  panic_handler: true             # 发生 panic 时打印寄存器
+
+# 版本信息
+version:
+  firmware: "0.1.0"
+  hardware: "v0.1"
+  build_date: ""                 # 编译时自动填入
+  git_commit: ""                 # 编译时自动填入

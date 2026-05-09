@@ -1,0 +1,56 @@
+# 音频参数配置
+
+# I2S 麦克风参数（硬件到货后填写真实值）
+i2s:
+  port: 0                       # I2S_NUM_0
+  sample_rate: 16000            # 采样率（Hz）
+  bits_per_sample: 16           # 位深
+  channels: 1                   # 单声道
+  channel_format: 0             # 0 = 左声道
+  communication_format: 0       # I2S_COMM_FORMAT_STAND_I2S
+  gpio:
+    bck_io_num: 26              # BCK 引脚（待确认）
+    ws_io_num: 25               # WS 引脚（待确认）
+    data_in_num: 35             # DATA 引脚（待确认）
+    data_out_num: -1            # 不需要输出
+
+# WAV 文件格式
+wav:
+  format_tag: 1                 # PCM
+  bits_per_sample: 16
+  channels: 1
+  sample_rate: 16000
+  byte_rate: 32000             # sample_rate * channels * bits/8
+  block_align: 2               # channels * bits/8
+
+# 录音质量配置
+quality:
+  low:
+    sample_rate: 16000
+    bits: 16
+    channels: 1
+  medium:
+    sample_rate: 22050
+    bits: 16
+    channels: 1
+  high:
+    sample_rate: 44100
+    bits: 16
+    channels: 2
+
+# 默认质量
+default_quality: "low"
+
+# 文件命名
+naming:
+  prefix: "REC"
+  date_format: "YYYYMMDD"
+  time_format: "HHMMSS"
+  example: "REC_20260509_183000.wav"
+
+# 存储空间管理
+storage:
+  max_file_size_mb: 50         # 单个文件最大 50MB
+  min_free_space_mb: 1         # 剩余空间低于 1MB 时停止录音
+  auto_delete_oldest: false     # 空间不足时是否自动删除最旧文件
+  archive_after_upload: true    # 上传后归档（移到 /sdcard/done/）

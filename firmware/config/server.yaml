@@ -1,0 +1,71 @@
+# 服务器配置
+
+# Mac 服务器地址（ESP32 上传目标）
+server:
+  host: "192.168.31.185"   # Mac 的 IP 地址
+  port: 8000                  # 服务器端口
+  upload_path: "/upload"      # 上传接口路径
+  timeout_ms: 30000           # 上传超时（毫秒）
+
+# WiFi 配置（量产时从 NVS 读取，此处为默认值）
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
+
+# 日志配置
+logging:
+  level: "INFO"               # DEBUG, INFO, WARN, ERROR
+  outputs:
+    console: true
+    sd_card: false             # 硬件到货后改为 true
+    network: false             # 硬件到货后改为 true
+  sd_card_path: "/sdcard/logs/"
+
+# 录音参数（由 recorder 组件使用）
+recorder:
+  default_sample_rate: 16000
+  default_bits: 16
+  default_channels: 1
+  max_duration_sec: 300        # 最长录音 5 分钟
+  file_prefix: "REC"
+  storage_path: "/sdcard/records/"
+
+# 上传配置
+upload:
+  retry_max: 3
+  retry_delay_ms: 5000
+  max_file_size_mb: 50
+  pending_dir: "/sdcard/pending/"
+  done_dir: "/sdcard/done/"
+
+# 电池配置
+battery:
+  adc_channel: 0
+  voltage_full: 4.2
+  voltage_empty: 3.3
+  low_threshold_pct: 10
+  critical_threshold_pct: 5
+
+# LED 配置
+led:
+  gpio: 2
+  invert: false
+
+# 按钮配置
+button:
+  gpio: 0
+  active_level: 0              # 0 = 低电平触发（ESP32 BOOT 按钮）
+  long_press_ms: 3000
+
+# 休眠配置
+sleep:
+  idle_timeout_sec: 60         # 空闲多久进入休眠
+  wakeup_timer_sec: 600        # 定时唤醒间隔
+  wakeup_gpio: 0              # 唤醒 GPIO（按钮）
+
+# 开发模式（stub 阶段）
+dev:
+  stub_mode: true              # true = 桩实现，false = 真实硬件
+  mock_i2s: true              # 模拟 I2S 数据
+  mock_wifi: true             # 模拟 WiFi 连接
+  mock_sdcard: true           # 模拟 SD 卡
