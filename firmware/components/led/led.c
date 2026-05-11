@@ -1,144 +1,145 @@
 /**
  * @file led.c
- * @brief LED 指示模块 - 源文件
+ * @brief LED 组件 - WS2812B RGB LED 驱动实现（Pattern 版）
  *
- * 功能：
- * - 状态指示（未连 WiFi / 录音中 / 上传中 / 错误）
- * - 呼吸灯效果（LEDC PWM）
- * - 电量指示
+ * 基于 ESP-IDF RMT TX + led_strip_encoder
+ * Pattern 由内部 esp_timer 驱动，50ms 更新间隔。
  */
 
 #include "led.h"
+#include "led_strip_encoder.h"
+#include "driver/rmt_tx.h"
+#include "esp_err.h"
 #include "esp_log.h"
-#include "driver/ledc.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <math.h>
 
 static const char *TAG = "led";
 
-// LEDC 配置
-#define LEDC_TIMER              LEDC_TIMER_0
-#define LEDC_MODE               LEDC_LOW_SPEED_MODE
-#define LEDC_DUTY_RES           LEDC_TIMER_8_BIT  // 8-bit resolution (0-255)
-#define LEDC_FREQUENCY          5000              // 5 kHz PWM frequency
+/* WS2812B 只需 3 字节（GRB）*/
+#define LED_PIXEL_BUF_SIZE  3
 
-// 呼吸灯参数
-#define BREATH_PERIOD_MS        2000               // 呼吸周期 2 秒
+/* Pattern 更新周期（ms）*/
+#define LED_TICK_MS         50
 
-// LED 状态
-static gpio_num_t s_gpio_num = GPIO_NUM_NC;
-static led_state_t s_current_state = LED_STATE_OFF;
-static bool s_initialized = false;
-static esp_timer_handle_t s_led_timer = NULL;
-static uint32_t s_breathe_duty = 0;
-static int64_t s_last_toggle_time = 0;
-static int s_blink_count = 0;
-static int s_blink_target = 0;
+/* 静态变量 */
+static rmt_channel_handle_t      s_rmt_chan      = NULL;
+static rmt_encoder_handle_t      s_led_encoder   = NULL;
+static bool                      s_initialized    = false;
 
-/**
- * @brief LED 定时器回调
- */
-static void led_timer_callback(void *arg)
+/* Pattern 状态 */
+static led_pattern_config_t      s_pattern        = {0};
+static bool                      s_pattern_active  = false;
+
+/* 更新定时器 */
+static esp_timer_handle_t         s_tick_timer    = NULL;
+
+/* LED 像素缓冲区（GRB 顺序，WS2812B 格式）*/
+static uint8_t                   s_pixel_buf[LED_PIXEL_BUF_SIZE];
+
+/* 内部时间戳（ms），用于计算 breathing/blink 相位 */
+static uint64_t                  s_tick_count     = 0;
+
+/*————————————————————————————
+ * 内部：硬件发送一次像素
+ *————————————————————————————*/
+static void led_refresh(void)
 {
-    if (!s_initialized) {
-        return;
+    if (!s_initialized) return;
+
+    rmt_transmit_config_t tx_cfg = {
+        .loop_count = 0,
+        .flags.eot_level = 0,
+    };
+
+    rmt_transmit(s_rmt_chan, s_led_encoder,
+                 s_pixel_buf, sizeof(s_pixel_buf), &tx_cfg);
+    rmt_tx_wait_all_done(s_rmt_chan, pdMS_TO_TICKS(100));
+}
+
+/*————————————————————————————
+ * 内部：计算当前亮度并刷新
+ *————————————————————————————*/
+static void led_update(void)
+{
+    if (!s_initialized || !s_pattern_active) return;
+
+    s_tick_count++;
+
+    uint8_t r = 0, g = 0, b = 0;
+    float   brightness = 1.0f;
+
+    switch (s_pattern.pattern) {
+        case LED_PATTERN_OFF:
+            r = g = b = 0;
+            break;
+
+        case LED_PATTERN_STATIC:
+            r = s_pattern.r;
+            g = s_pattern.g;
+            b = s_pattern.b;
+            break;
+
+        case LED_PATTERN_BREATHING: {
+            uint16_t period_ms  = s_pattern.param1 > 0 ? s_pattern.param1 : 2000; // 默认 2s 周期
+            uint16_t min_pct   = s_pattern.param2 > 0 ? s_pattern.param2 : 20;     // 默认最低 20%
+            uint64_t total_ticks = period_ms / LED_TICK_MS;
+            float   phase = (s_tick_count % total_ticks) * (2.0f * M_PI / total_ticks);
+            // sin ∈ [-1, 1] → [0, 1]
+            float sin_val = ( sinf((float)phase) + 1.0f ) / 2.0f;
+            float min_bright = min_pct / 100.0f;
+            brightness = min_bright + sin_val * (1.0f - min_bright);
+            r = (uint8_t)(s_pattern.r * brightness);
+            g = (uint8_t)(s_pattern.g * brightness);
+            b = (uint8_t)(s_pattern.b * brightness);
+            break;
+        }
+
+        case LED_PATTERN_BLINK: {
+            uint16_t freq_hz   = s_pattern.param1 > 0 ? s_pattern.param1 : 2;  // 默认 2Hz
+            uint16_t duty_pct  = s_pattern.param2 > 0 ? s_pattern.param2 : 50; // 默认 50% 占空比
+            uint64_t cycle_ticks = 1000 / LED_TICK_MS / freq_hz;                // 一周期 tick 数
+            uint64_t on_ticks   = cycle_ticks * duty_pct / 100;
+            bool on = (s_tick_count % cycle_ticks) < on_ticks;
+            if (on) {
+                r = s_pattern.r;
+                g = s_pattern.g;
+                b = s_pattern.b;
+            } else {
+                r = g = b = 0;
+            }
+            break;
+        }
+
+        default:
+            return;
     }
 
-    int64_t now = esp_timer_get_time() / 1000;
-    led_state_t state = s_current_state;
+    /* WS2812B 颜色顺序：GRB */
+    bool changed = (s_pixel_buf[0] != g) || (s_pixel_buf[1] != r) || (s_pixel_buf[2] != b);
+    s_pixel_buf[0] = g;
+    s_pixel_buf[1] = r;
+    s_pixel_buf[2] = b;
 
-    switch (state) {
-    case LED_STATE_OFF:
-        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, 0);
-        ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0);
-        break;
-
-    case LED_STATE_IDLE:
-        // 慢闪：1Hz
-        if (now - s_last_toggle_time >= 500) {
-            s_last_toggle_time = now;
-            static bool on = false;
-            on = !on;
-            ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, on ? 128 : 0);
-            ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0);
-        }
-        break;
-
-    case LED_STATE_WIFI_CONN:
-        // 快闪：4Hz
-        if (now - s_last_toggle_time >= 125) {
-            s_last_toggle_time = now;
-            static bool on = false;
-            on = !on;
-            ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, on ? 200 : 0);
-            ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0);
-        }
-        break;
-
-    case LED_STATE_RECORDING:
-        // 常亮
-        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, 255);
-        ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0);
-        break;
-
-    case LED_STATE_UPLOADING:
-        // 呼吸灯
-        {
-            static int64_t breath_start = 0;
-            if (breath_start == 0) breath_start = now;
-
-            uint32_t elapsed = (now - breath_start) % BREATH_PERIOD_MS;
-            float progress = (float)elapsed / BREATH_PERIOD_MS;
-            // 正弦波呼吸
-            float duty = (1.0f - cosf(progress * 2 * 3.14159f)) / 2.0f * 255.0f;
-            uint32_t duty_val = (uint32_t)duty;
-
-            ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, duty_val);
-            ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0);
-        }
-        break;
-
-    case LED_STATE_ERROR:
-        // 快闪 3 次后熄灭
-        if (s_blink_target == 0) {
-            s_blink_target = 6;  // 3 次闪烁 = 6 次切换
-            s_blink_count = 0;
-            s_last_toggle_time = now;
-        }
-        if (s_blink_count < s_blink_target) {
-            if (now - s_last_toggle_time >= 100) {
-                s_last_toggle_time = now;
-                s_blink_count++;
-                static bool on = false;
-                on = !on;
-                ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, on ? 255 : 0);
-                ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0);
-            }
-        } else {
-            ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, 0);
-            ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0);
-        }
-        break;
-
-    case LED_STATE_LOW_BAT:
-        // 红闪
-        if (now - s_last_toggle_time >= 500) {
-            s_last_toggle_time = now;
-            static bool on = false;
-            on = !on;
-            ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, on ? 255 : 0);
-            ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0);
-        }
-        break;
-
-    default:
-        break;
+    if (changed || s_pattern.pattern == LED_PATTERN_OFF) {
+        led_refresh();
     }
 }
 
-/**
- * @brief 初始化 LED
- */
+/*————————————————————————————
+ * 定时器回调（静态，不能传参数）
+ *————————————————————————————*/
+static void led_tick_callback(void *arg)
+{
+    (void)arg;
+    led_update();
+}
+
+/*————————————————————————————
+ * led_init — 初始化 LED
+ *————————————————————————————*/
 esp_err_t led_init(gpio_num_t gpio_num)
 {
     if (s_initialized) {
@@ -146,72 +147,97 @@ esp_err_t led_init(gpio_num_t gpio_num)
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "Initializing LED on GPIO %d", gpio_num);
+    ESP_LOGI(TAG, "Initializing WS2812B on GPIO%d", gpio_num);
 
-    // 保存 GPIO
-    s_gpio_num = gpio_num;
-
-    // 配置 LEDC 定时器
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode = LEDC_MODE,
-        .timer_num = LEDC_TIMER,
-        .duty_resolution = LEDC_DUTY_RES,
-        .freq_hz = LEDC_FREQUENCY,
-        .clk_cfg = LEDC_AUTO_CLK,
+    /* 1. RMT TX 通道 */
+    rmt_tx_channel_config_t tx_chan_cfg = {
+        .clk_src           = RMT_CLK_SRC_DEFAULT,
+        .gpio_num          = gpio_num,
+        .mem_block_symbols = 64,
+        .resolution_hz     = 10 * 1000 * 1000,  /* 10 MHz */
+        .trans_queue_depth = 4,
     };
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_cfg, &s_rmt_chan));
 
-    // 配置 LEDC 通道
-    ledc_channel_config_t ledc_channel = {
-        .speed_mode = LEDC_MODE,
-        .channel = LEDC_CHANNEL_0,
-        .timer_sel = LEDC_TIMER,
-        .intr_type = LEDC_INTR_DISABLE,
-        .gpio_num = gpio_num,
-        .duty = 0,
-        .hpoint = 0,
+    /* 2. led_strip_encoder */
+    led_strip_encoder_config_t enc_cfg = {
+        .resolution = 10 * 1000 * 1000,
     };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    ESP_ERROR_CHECK(rmt_new_led_strip_encoder(&enc_cfg, &s_led_encoder));
 
-    // 关闭 LED（初始状态）
-    ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, 0);
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0);
+    /* 3. 使能 RMT */
+    ESP_ERROR_CHECK(rmt_enable(s_rmt_chan));
 
-    // 创建定时器（用于状态控制）
-    esp_timer_create_args_t timer_args = {
-        .callback = led_timer_callback,
-        .arg = NULL,
-        .name = "led_timer"
+    /* 4. 创建更新定时器 */
+    const esp_timer_create_args_t timer_args = {
+        .callback = &led_tick_callback,
+        .name     = "led_tick",
     };
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_led_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(s_led_timer, 20));  // 20ms 更新周期
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_tick_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_tick_timer, LED_TICK_MS * 1000));  // 微秒
 
-    s_initialized = true;
-    ESP_LOGI(TAG, "LED initialized successfully");
+    s_initialized   = true;
+    s_pattern_active = false;
+    s_tick_count    = 0;
+
+    /* 5. 默认熄灭 */
+    led_off();
+
+    ESP_LOGI(TAG, "LED initialized OK (GPIO%d, tick=%dms)", gpio_num, LED_TICK_MS);
+    return ESP_OK;
+}
+
+/*————————————————————————————
+ * led_set_pattern — 设置 Pattern
+ *————————————————————————————*/
+esp_err_t led_set_pattern(const led_pattern_config_t *config)
+{
+    if (!s_initialized) {
+        ESP_LOGW(TAG, "LED not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_pattern       = *config;
+    s_pattern_active = (config->pattern != LED_PATTERN_OFF);
+
+    /* 立即刷新一次 */
+    led_update();
+
+    ESP_LOGI(TAG, "Pattern: %d, RGB(%d,%d,%d), p1=%d, p2=%d",
+             config->pattern, config->r, config->g, config->b,
+             config->param1, config->param2);
 
     return ESP_OK;
 }
 
-/**
- * @brief 设置 LED 状态
- */
-void led_set_state(led_state_t state)
+/*————————————————————————————
+ * led_set_color — 设置固定颜色
+ *————————————————————————————*/
+esp_err_t led_set_color(uint8_t r, uint8_t g, uint8_t b)
 {
-    if (!s_initialized) {
-        ESP_LOGW(TAG, "LED not initialized");
-        return;
-    }
-
-    ESP_LOGI(TAG, "LED state: %d", state);
-    s_current_state = state;
-    s_blink_target = 0;  // 重置闪烁计数
-    s_blink_count = 0;
+    led_pattern_config_t cfg = {
+        .pattern = LED_PATTERN_STATIC,
+        .r       = r,
+        .g       = g,
+        .b       = b,
+        .param1  = 0,
+        .param2  = 0,
+    };
+    return led_set_pattern(&cfg);
 }
 
-/**
- * @brief 关闭 LED
- */
+/*————————————————————————————
+ * led_off — 熄灭 LED
+ *————————————————————————————*/
 void led_off(void)
 {
-    led_set_state(LED_STATE_OFF);
+    if (!s_initialized) return;
+    led_pattern_config_t cfg = {
+        .pattern = LED_PATTERN_OFF,
+        .r = 0, .g = 0, .b = 0,
+    };
+    led_set_pattern(&cfg);
 }

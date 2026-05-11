@@ -30,6 +30,12 @@ esp_err_t storage_mount(const char *mount_point);
 void storage_unmount(void);
 
 /**
+ * @brief 测试 SD 卡读写（创建 test.txt 并验证）
+ * @return ESP_OK=成功，其他=失败
+ */
+esp_err_t storage_test_rw(void);
+
+/**
  * @brief 获取 TF 卡剩余空间（字节）
  * @param[out] out_total_kb 总空间（KB）
  * @param[out] out_free_kb  剩余空间（KB）

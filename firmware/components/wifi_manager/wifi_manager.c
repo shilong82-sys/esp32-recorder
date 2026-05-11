@@ -115,7 +115,7 @@ esp_err_t wifi_manager_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
     // 创建自动重连任务
-    xTaskCreatePinnedToCore(reconnect_task, "wifi_reconnect", 4096, NULL, 3, &s_reconnect_task, 0);
+    xTaskCreatePinnedToCore(reconnect_task, "wifi_rec", 4096, NULL, 3, &s_reconnect_task, 0);
 
     ESP_LOGI(TAG, "WiFi Manager initialized");
     return ESP_OK;

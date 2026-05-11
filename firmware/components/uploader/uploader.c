@@ -55,8 +55,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
         ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA len=%d", evt->data_len);
         // 如果需要处理响应数据，可以在这里
         if (evt->user_data && evt->data_len > 0) {
-            char **response = (char **)evt->user_data;
-            int *len = (int *)((char **)evt->user_data + 1);
+            (void)evt->user_data;  // reserved for future response handling
             // 简化处理：直接打印响应
             ESP_LOGI(TAG, "Server response: %.*s", evt->data_len, (char *)evt->data);
         }
@@ -163,10 +162,8 @@ static esp_err_t upload_single_file(const char *file_path)
     uint8_t buffer[CHUNK_SIZE];
     size_t bytes_read;
     uint32_t total_sent = 0;
-    int content_length = 0;
-
-    // 计算 multipart body 大小（简化估算）
-    content_length = 256 + file_size + 100;
+    int content_length = 256 + file_size + 100;  // estimated (reserved for future use)
+    (void)content_length;  // silence unused warning
 
     // 发送 multipart 头部
     char header[512];

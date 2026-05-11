@@ -21,7 +21,7 @@ static const char *TAG = "battery";
 
 // 默认配置（适用于 3.7V 锂电池）
 #define DEFAULT_ADC_CHANNEL    ADC_CHANNEL_0  // GPIO 1
-#define DEFAULT_ADC_ATTEN     ADC_ATTEN_DB_11
+#define DEFAULT_ADC_ATTEN     ADC_ATTEN_DB_12
 #define DEFAULT_VOLTAGE_DIV   2.0f          // 分压比
 #define DEFAULT_FULL_VOLTAGE  4.20f         // 锂电池满电
 #define DEFAULT_EMPTY_VOLTAGE 3.30f         // 锂电池低压保护
