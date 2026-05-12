@@ -1,273 +1,293 @@
-# 状态机设计文档
+# 状态机设计 — ESP32 AI Recorder
 
-> ESP32 AI Recorder 系统状态机
-> 版本：v0.1 | 日期：2026-05-09
+> Version: v0.3 | Updated: 2026-05-12
+> 状态机是设备行为的最高权威，所有模块通过 `state_set()` 切换状态，通过订阅 `EVENT_STATE_CHANGED` 响应变化。
 
 ---
 
 ## 1. 状态总览
 
-```mermaid
-stateDiagram-v2
-    [*] --> BOOT : 上电
-    BOOT --> IDLE : 初始化完成
-    IDLE --> RECORDING : 按钮短按 / 定时触发
-    RECORDING --> SAVE_PENDING : 按钮短按 / 空间不足 / 电量低
-    SAVE_PENDING --> WIFI_CONNECTING : 有文件待上传
-    SAVE_PENDING --> IDLE : 无文件待上传
-    WIFI_CONNECTING --> UPLOADING : WiFi 连接成功
-    WIFI_CONNECTING --> IDLE : WiFi 连接失败（超时）
-    UPLOADING --> IDLE : 上传完成
-    UPLOADING --> ERROR : 上传失败（重试耗尽）
-    IDLE --> SLEEP : 空闲超时
-    SLEEP --> IDLE : 按钮中断 / 定时唤醒
-    ERROR --> IDLE : 错误恢复（自动 / 按钮）
-    ERROR --> [*] : 严重错误（看门狗复位）
-```
+| # | 状态 | 枚举值 | 说明 |
+|---|-------|--------|------|
+| 1 | `INIT` | `DEVICE_STATE_INIT` | 系统初始化，各模块依次启动 |
+| 2 | `IDLE` | `DEVICE_STATE_IDLE` | 待机，等待用户操作 |
+| 3 | `RECORD_ARMED` | `DEVICE_STATE_RECORD_ARMED` | 已武装，预热身完成，随时开始录音 |
+| 4 | `RECORDING` | `DEVICE_STATE_RECORDING` | 正在采集 I2S 音频并写入 SD 卡 |
+| 5 | `RECORD_STOPPING` | `DEVICE_STATE_RECORD_STOPPING` | 停止请求已发出，正在 flush buffer、更新 WAV 头 |
+| 6 | `PROCESSING` | `DEVICE_STATE_PROCESSING` | 后处理：修剪静音、更新 WAV 头、生成元数据 |
+| 7 | `UPLOADING` | `DEVICE_STATE_UPLOADING` | 将 WAV 文件通过 HTTP 上传至 Mac 服务端 |
+| 8 | `LOW_BATTERY` | `DEVICE_STATE_LOW_BATTERY` | 电量低警告状态，提示用户充电 |
+| 9 | `ERROR` | `DEVICE_STATE_ERROR` | 可恢复错误，停留一段时间后自动恢复 |
+| 10 | `SLEEP` | `DEVICE_STATE_SLEEP` | 深度睡眠，仅 GPIO0 中断或定时器可唤醒 |
 
 ---
 
 ## 2. 各状态详细说明
 
-### 2.1 BOOT（启动）
+### 2.1 INIT
 
-| 项目 | 说明 |
+| 属性 | 说明 |
 |------|------|
-| **职责** | 上电后一次性初始化，完成后不再进入 |
-| **入口** | 上电 / 复位 / 看门狗复位 |
-| **出口** | 初始化成功 → IDLE；初始化失败 → ERROR |
-| **允许中断** | ❌ 不允许，必须完成初始化 |
-| **原子性** | ✅ 必须原子执行 |
-
-**初始化步骤：**
-1. NVS 初始化
-2. SD 卡挂载
-3. LED GPIO 初始化
-4. 按钮初始化
-5. 电池 ADC 初始化
-6. WiFi 初始化（不阻塞）
-7. 录音模块初始化
-8. 上传模块初始化
-9. 加载配置（NVS + 配置文件）
-10. 扫描 SD 卡是否有未上传文件
-
-**超时保护：** 若任何步骤超过 10 秒，进入 ERROR 状态。
+| **职责** | 按顺序初始化所有模块：NVS → event_bus → state → LED → button → ui → audio → storage → WiFi → recorder → battery → uploader |
+| **进入条件** | 系统上电，自动进入 |
+| **退出条件** | 所有模块初始化完成 → `IDLE`；任一关键模块失败 → `ERROR` |
+| **可触发事件** | `EVENT_STORAGE_READY` / `EVENT_STORAGE_ERROR`、`EVENT_WIFI_CONNECTED` / `EVENT_WIFI_DISCONNECTED`、`EVENT_BATTERY_LOW` / `EVENT_BATTERY_CRITICAL` |
+| **LED 行为** | 白灯常亮 |
+| **允许录音** | ❌ 否 |
+| **允许 WiFi** | ⚠️ 初始化中（内部） |
+| **允许上传** | ❌ 否 |
 
 ---
 
-### 2.2 IDLE（空闲）
+### 2.2 IDLE
 
-| 项目 | 说明 |
+| 属性 | 说明 |
 |------|------|
-| **职责** | 等待用户操作或定时事件，低功耗待机 |
-| **入口** | BOOT 完成 / 上传完成 / 休眠唤醒 |
-| **出口** | 按钮短按 → RECORDING；空闲超时 → SLEEP；有文件待上传 → WIFI_CONNECTING |
-| **允许中断** | ✅ 允许（按钮、定时器） |
-| **原子性** | ❌ 不需要 |
-
-**活动：**
-- LED 慢闪（1Hz）表示等待
-- 每 5 秒检查一次电池电量
-- 每 30 秒检查一次是否有待上传文件
-- 监听按钮事件
-
-**退出条件：**
-- 按钮短按 → RECORDING
-- 有文件待上传且 WiFi 已连接 → UPLOADING
-- 有文件待上传且 WiFi 未连接 → WIFI_CONNECTING
-- 空闲超时（可配置，默认 60 秒）→ SLEEP
+| **职责** | 等待用户操作；周期性检查待上传文件；监控电池状态 |
+| **进入条件** | `INIT` 完成；或 `RECORD_STOPPING`/`PROCESSING`/`UPLOADING`/`ERROR` 完成恢复 |
+| **退出条件** | 单击按钮 → `RECORD_ARMED`；有待上传文件且 WiFi 已连接 → `UPLOADING`；空闲超时 → `SLEEP`；电池低于阈值 → `LOW_BATTERY` |
+| **可触发事件** | `EVENT_BUTTON_CLICKED`、`EVENT_WIFI_CONNECTED`、`EVENT_UPLOAD_DONE`、`EVENT_BATTERY_LOW` |
+| **LED 行为** | 绿灯慢闪（1 Hz） |
+| **允许录音** | ⚠️ 单击后进入 `RECORD_ARMED`，不直接录音 |
+| **允许 WiFi** | ✅ 是 |
+| **允许上传** | ✅ 是（在有待上传文件时） |
 
 ---
 
-### 2.3 RECORDING（录音中）
+### 2.3 RECORD_ARMED
 
-| 项目 | 说明 |
+| 属性 | 说明 |
 |------|------|
-| **职责** | 通过 I2S 接收麦克风数据，写入 WAV 文件到 SD 卡 |
-| **入口** | IDLE 状态收到按钮短按 / 定时触发 |
-| **出口** | 按钮短按 → SAVE_PENDING；空间不足 → SAVE_PENDING；电量低 → SAVE_PENDING |
-| **允许中断** | ⚠️ 只允许按钮中断（长按强制停止） |
-| **原子性** | ❌ 不需要（但中断需快速处理） |
+| **职责** | 录音"武装"状态：预分配文件、初始化 I2S DMA、准备好后立即进入 `RECORDING`。此状态存在时间极短（< 100ms），用于平滑过渡 |
+| **进入条件** | `IDLE` + `EVENT_BUTTON_CLICKED` |
+| **退出条件** | I2S/DMA 准备完成 → `RECORDING`；准备失败 → `ERROR` |
+| **可触发事件** | `EVENT_RECORDING_STARTED`（内部）、`EVENT_STORAGE_ERROR` |
+| **LED 行为** | 红灯快闪（5 Hz），表示"即将开始" |
+| **允许录音** | ⚠️ 准备中，尚未开始实际录音 |
+| **允许 WiFi** | ❌ 否（录音期间关闭 WiFi 以降功耗和减少干扰） |
+| **允许上传** | ❌ 否 |
 
-**活动：**
-- I2S 接收音频数据
-- 实时写入 SD 卡（WAV 格式）
-- LED 快闪（5Hz）表示录音中
-- 每 1 秒更新一次文件大小
-- 监控电池电量（低于 10% 触发停止）
-
-**中断处理：**
-- 按钮短按 → 正常停止，进入 SAVE_PENDING
-- 按钮长按（>3 秒）→ 强制停止，进入 SAVE_PENDING
-- 空间不足 → 停止录音，进入 SAVE_PENDING
-- 电量低（<5%）→ 停止录音，进入 SAVE_PENDING
+> **设计说明**：`RECORD_ARMED` 是一个短暂的中间状态，目的是将"用户触发"与"实际启动 I2S DMA"解耦，避免在 `IDLE` 状态的处理函数中执行耗时操作。
 
 ---
 
-### 2.4 SAVE_PENDING（保存待上传）
+### 2.4 RECORDING
 
-| 项目 | 说明 |
+| 属性 | 说明 |
 |------|------|
-| **职责** | 关闭 WAV 文件，更新文件头，标记待上传 |
-| **入口** | RECORDING 停止 |
-| **出口** | 有文件待上传 → WIFI_CONNECTING；无文件 → IDLE |
-| **允许中断** | ❌ 不允许，必须完成文件保存 |
-| **原子性** | ✅ 必须原子执行 |
-
-**活动：**
-1. 关闭 WAV 文件（更新 RIFF header 的 file size）
-2. 在文件末尾写入元数据（时间戳、电量、录音参数）
-3. 在 `/sdcard/pending/` 创建上传任务文件（JSON）
-4. 检查是否有其他待上传文件
-
-**错误处理：**
-- 若文件关闭失败 → 标记文件为损坏，跳过
-- 若 SD 卡满载 → 删除最旧的文件（可配置）
+| **职责** | I2S 音频持续采集 → RingBuffer → WAV 文件写入 SD 卡；监控存储空间和电池 |
+| **进入条件** | `RECORD_ARMED` + I2S/DMA 准备完成 |
+| **退出条件** | 单击按钮 → `RECORD_STOPPING`；SD 卡满 → `RECORD_STOPPING`（带错误标记）；电池极低 → `RECORD_STOPPING` → `LOW_BATTERY` |
+| **可触发事件** | `EVENT_RECORDING_STOPPED`（内部停止）、`EVENT_STORAGE_ERROR`、`EVENT_BATTERY_CRITICAL` |
+| **LED 行为** | 红灯快闪（5 Hz）|
+| **允许录音** | ✅ 是（正在录音） |
+| **允许 WiFi** | ❌ 否 |
+| **允许上传** | ❌ 否 |
 
 ---
 
-### 2.5 WIFI_CONNECTING（WiFi 连接中）
+### 2.5 RECORD_STOPPING
 
-| 项目 | 说明 |
+| 属性 | 说明 |
 |------|------|
-| **职责** | 连接 WiFi，获取 IP 地址 |
-| **入口** | SAVE_PENDING 有文件待上传，且 WiFi 未连接 |
-| **出口** | 连接成功 → UPLOADING；失败 → IDLE（重试机制） |
-| **允许中断** | ❌ 不允许（但 WiFi 事件回调是异步的） |
-| **原子性** | ⚠️ 半原子（连接过程是异步的，但状态切换是原子的） |
+| **职责** | 停止 I2S DMA；flush RingBuffer 中剩余数据；更新 WAV 文件头（data chunk size）；关闭文件 |
+| **进入条件** | `RECORDING` + 停止条件触发 |
+| **退出条件** | 文件关闭完成 → `PROCESSING`（如果需要后处理）或 `IDLE`（如果不需要） |
+| **可触发事件** | `EVENT_RECORDING_STOPPED`（完成） |
+| **LED 行为** | 橙灯呼吸（表示"正在停止"）|
+| **允许录音** | ❌ 否（正在停止） |
+| **允许 WiFi** | ❌ 否 |
+| **允许上传** | ❌ 否 |
 
-**活动：**
-1. 检查是否已保存的 WiFi 凭证（NVS）
-2. 若没有 → 进入配网模式（BLE / SmartConfig）
-3. 若有 → 尝试连接
-4. 超时 15 秒 → 重试（最多 3 次）
-5. 重试耗尽 → 返回 IDLE（延迟上传）
-
-**配网模式（Phase 2 实现）：**
-- 启动 BLE 服务器，等待手机 App 配置 WiFi
-- 或启动 SmartConfig，等待 ESP-Touch App
+> **设计说明**：此状态的存在是因为 SD 卡写入有延迟（尤其是 FATFS 更新文件 alloc table 时）。不能直接从 `RECORDING` 跳到 `IDLE`，否则文件可能损坏。
 
 ---
 
-### 2.6 UPLOADING（上传中）
+### 2.6 PROCESSING
 
-| 项目 | 说明 |
+| 属性 | 说明 |
 |------|------|
-| **职责** | 将 SD 卡上的录音文件上传到 Mac 服务器 |
-| **入口** | WIFI_CONNECTING 成功 / IDLE 检测到待上传文件且 WiFi 已连接 |
-| **出口** | 上传成功 → IDLE；失败重试耗尽 → ERROR |
-| **允许中断** | ❌ 不允许（上传过程可被取消，但不是中断） |
-| **原子性** | ⚠️ 半原子（上传是分块的，但整个上传任务应该完成或失败） |
+| **职责** | WAV 文件后处理：确认文件头完整、可选修剪开头/结尾静音、生成上传任务描述文件（JSON）|
+| **进入条件** | `RECORD_STOPPING` + 文件关闭完成 |
+| **退出条件** | 后处理完成 → `IDLE`（如果不需要上传）或 自动触发 → `UPLOADING`；处理失败 → `ERROR` |
+| **可触发事件** | `EVENT_UPLOAD_STARTED`（自动触发）|
+| **LED 行为** | 蓝灯呼吸 |
+| **允许录音** | ❌ 否 |
+| **允许 WiFi** | ✅ 是（准备上传） |
+| **允许上传** | ⚠️ 即将开始 |
 
-**活动：**
-1. 从 `/sdcard/pending/` 读取上传任务
-2. 逐个上传文件（HTTP POST multipart/form-data）
-3. 显示上传进度（LED 呼吸灯）
-4. 上传成功后，将文件从 `/sdcard/pending/` 移到 `/sdcard/done/`
-5. 上传失败后，重试（最多 3 次，间隔 5 秒）
-
-**错误处理：**
-- 网络断开 → 暂停上传，返回 WIFI_CONNECTING
-- 服务器 4xx → 放弃该文件（可能损坏），标记为失败
-- 服务器 5xx → 重试
-- 超时（30 秒）→ 重试
+> **设计说明**：v0.2 可简化：后处理为空，直接从 `RECORD_STOPPING` → `IDLE`。此状态保留为 v0.3+ 扩展预留。
 
 ---
 
-### 2.7 SLEEP（休眠）
+### 2.7 UPLOADING
 
-| 项目 | 说明 |
+| 属性 | 说明 |
 |------|------|
-| **职责** | 低功耗模式，等待中断唤醒 |
-| **入口** | IDLE 状态空闲超时 |
-| **出口** | 按钮中断 → IDLE；定时唤醒 → IDLE；电量极低 → [*]（关机） |
-| **允许中断** | ✅ 允许（按钮、定时器、电量监控） |
-| **原子性** | ❌ 不需要 |
-
-**活动：**
-1. 保存当前状态到 NVS
-2. 关闭不必要的外设（I2S、WiFi）
-3. 配置唤醒源（按钮 GPIO 中断、定时器）
-4. 进入 DeepSleep
-
-**唤醒条件：**
-- 按钮按下（GPIO 中断）
-- 定时器到期（可配置，默认 10 分钟）
-- 电量监控（若电量 < 5%，不进入 DeepSleep，直接关机）
+| **职责** | HTTP POST WAV 文件到 Mac 服务端；支持进度回调；失败时重试（最多 3 次）|
+| **进入条件** | `PROCESSING` 完成 或 `IDLE` 中检测到待上传文件 |
+| **退出条件** | 上传成功 → `IDLE`；重试耗尽 → `ERROR`；WiFi 断开 → `IDLE`（暂停上传）|
+| **可触发事件** | `EVENT_UPLOAD_DONE`、`EVENT_UPLOAD_FAILED`、`EVENT_WIFI_DISCONNECTED` |
+| **LED 行为** | 蓝灯呼吸（与 PROCESSING 区分：频率不同）|
+| **允许录音** | ❌ 否 |
+| **允许 WiFi** | ✅ 是（正在使用） |
+| **允许上传** | ✅ 是（正在上传） |
 
 ---
 
-### 2.8 ERROR（错误）
+### 2.8 LOW_BATTERY
 
-| 项目 | 说明 |
+| 属性 | 说明 |
 |------|------|
-| **职责** | 处理不可恢复错误或多次重试失败 |
-| **入口** | 任何状态发生严重错误 |
-| **出口** | 自动恢复 → IDLE；看门狗 → [*]（复位） |
-| **允许中断** | ✅ 允许（按钮强制复位） |
-| **原子性** | ❌ 不需要 |
-
-**活动：**
-1. 记录错误日志（SD 卡 + 串口）
-2. LED 快闪（10Hz）表示错误
-3. 显示错误码（通过 LED 闪烁次数）
-4. 尝试恢复（重新初始化故障模块）
-5. 若恢复失败 → 看门狗复位
-
-**错误码：**
-- 1 闪：SD 卡故障
-- 2 闪：WiFi 连接失败
-- 3 闪：上传失败
-- 4 闪：电池电量极低
-- 5 闪：I2S 故障
-
-**恢复策略：**
-- SD 卡故障 → 重新挂载（最多 3 次）
-- WiFi 连接失败 → 返回 IDLE，延迟重试
-- 上传失败 → 返回 IDLE，延迟重试
-- 电池电量极低 → 关机（不进入 DeepSleep）
-- I2S 故障 → 复位（看门狗）
+| **职责** | 提示用户充电；如果正在录音，先安全停止；超时后自动进入 `SLEEP` |
+| **进入条件** | 任意状态 + `EVENT_BATTERY_LOW`（电量 < 15%）|
+| **退出条件** | 用户充电（ADC 检测电压回升）→ `IDLE`；超时无操作 → `SLEEP` |
+| **可触发事件** | `EVENT_BATTERY_LOW`（持续检测）、`EVENT_BUTTON_CLICKED`（用户忽略警告）|
+| **LED 行为** | 红灯慢闪（1 Hz，与 IDLE 的绿灯区分）|
+| **允许录音** | ❌ 否（禁止新录音） |
+| **允许 WiFi** | ❌ 否（省电） |
+| **允许上传** | ❌ 否 |
 
 ---
 
-## 3. 状态切换事件汇总
+### 2.9 ERROR
 
-| 事件 | 源状态 | 目标状态 | 条件 |
-|------|--------|----------|------|
-| 按钮短按 | IDLE | RECORDING | - |
-| 按钮短按 | RECORDING | SAVE_PENDING | - |
-| 按钮长按（>3s） | RECORDING | SAVE_PENDING | 强制停止 |
-| 空间不足 | RECORDING | SAVE_PENDING | SD 卡剩余 < 1MB |
-| 电量低（<5%） | RECORDING | SAVE_PENDING | - |
-| 初始化完成 | BOOT | IDLE | - |
-| 初始化失败 | BOOT | ERROR | - |
-| 有文件待上传 | IDLE | WIFI_CONNECTING | WiFi 未连接 |
-| 有文件待上传 | IDLE | UPLOADING | WiFi 已连接 |
-| 空闲超时 | IDLE | SLEEP | 可配置，默认 60s |
-| WiFi 连接成功 | WIFI_CONNECTING | UPLOADING | - |
-| WiFi 连接失败 | WIFI_CONNECTING | IDLE | 重试耗尽 |
-| 上传成功 | UPLOADING | IDLE | - |
-| 上传失败 | UPLOADING | ERROR | 重试耗尽 |
-| 按钮中断 | SLEEP | IDLE | - |
-| 定时唤醒 | SLEEP | IDLE | - |
-| 自动恢复 | ERROR | IDLE | - |
-| 看门狗超时 | ERROR | [*] | 恢复失败 |
+| 属性 | 说明 |
+|------|------|
+| **职责** | 可恢复错误停留状态；显示错误类型（通过 LED 闪码）；超时或按钮触发恢复 |
+| **进入条件** | 任一状态发生可恢复错误（SD 卡错误、上传失败且重试耗尽、I2S 错误等）|
+| **退出条件** | 3s 后自动恢复 → `IDLE`；或 `EVENT_BUTTON_CLICKED` 立即恢复 |
+| **可触发事件** | `EVENT_BUTTON_CLICKED`（手动恢复）|
+| **LED 行为** | 红灯快闪（10 Hz，错误码通过闪码表示，见下文）|
+| **允许录音** | ❌ 否 |
+| **允许 WiFi** | ⚠️ 取决于错误类型 |
+| **允许上传** | ❌ 否 |
 
----
+#### 错误码 LED 闪码
 
-## 4. 设计原则
-
-1. **单一职责**：每个状态只做一件事
-2. **状态最小化**：不在状态中做多余的事
-3. **错误可恢复**：任何状态都能回到 IDLE
-4. **低功耗优先**：尽可能快地进入 SLEEP
-5. **用户可感知**：通过 LED 和按钮，用户知道当前状态
+| 错误类型 | 闪码（红灯快闪 N 次后暂停 1s） |
+|---------|-----------------------------|
+| SD 卡卸载/错误 | 1 闪 |
+| WiFi 连接失败 | 2 闪 |
+| 上传失败（重试耗尽） | 3 闪 |
+| I2S / 音频错误 | 4 闪 |
+| 未知错误 | 5 闪 |
 
 ---
 
-## 5. 后续扩展
+### 2.10 SLEEP
 
-- [ ] 添加 `CONFIG` 状态（BLE 配网）
-- [ ] 添加 `FIRMWARE_UPDATE` 状态（OTA）
-- [ ] 添加 `DIAGNOSTIC` 状态（自检模式）
-- [ ] 添加状态历史记录（NVS 循环缓冲区）
+| 属性 | 说明 |
+|------|------|
+| **职责** | 深度睡眠（deep sleep），仅 GPIO0 中断或定时器可唤醒；功耗 < 20µA |
+| **进入条件** | `IDLE` 超时（默认 60s 无操作）；或 `LOW_BATTERY` 超时 |
+| **退出条件** | GPIO0 中断（按钮按下）→ `INIT`（唤醒后相当于重启）；定时器唤醒 → `INIT` |
+| **可触发事件** | （深度睡眠期间无事件处理，唤醒后重新 INIT） |
+| **LED 行为** | 熄灭 |
+| **允许录音** | ❌ 否 |
+| **允许 WiFi** | ❌ 否 |
+| **允许上传** | ❌ 否 |
+
+---
+
+## 3. 完整状态迁移表
+
+| 从 \ 到 | INIT | IDLE | RECORD_ARMED | RECORDING | RECORD_STOPPING | PROCESSING | UPLOADING | LOW_BATTERY | ERROR | SLEEP |
+|---------|------|------|--------------|-----------|------------------|------------|-----------|-------------|-------|-------|
+| **INIT** | — | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| **IDLE** | ❌ | — | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **RECORD_ARMED** | ❌ | ❌ | — | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| **RECORDING** | ❌ | ❌ | ❌ | — | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ |
+| **RECORD_STOPPING** | ❌ | ❌ | ❌ | ❌ | — | ✅ | ❌ | ❌ | ✅ | ❌ |
+| **PROCESSING** | ❌ | ✅ | ❌ | ❌ | ❌ | — | ✅ | ❌ | ✅ | ❌ |
+| **UPLOADING** | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | — | ❌ | ✅ | ❌ |
+| **LOW_BATTERY** | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌ | ✅ |
+| **ERROR** | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | — | ❌ |
+| **SLEEP** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | — |
+
+> ✅ = 合法迁移；❌ = 非法迁移
+
+---
+
+## 4. 非法状态迁移说明
+
+| 非法迁移 | 原因 |
+|---------|------|
+| `INIT` → `RECORD_ARMED` / `RECORDING` 等 | 初始化未完成，不允许用户操作 |
+| `IDLE` → `RECORDING`（跳过 `RECORD_ARMED`） | 必须经过武装状态完成 I2S 准备 |
+| `RECORDING` → `IDLE`（跳过 `RECORD_STOPPING`） | 直接跳回 IDLE 会导致 WAV 文件头未更新，文件损坏 |
+| `RECORD_STOPPING` → `RECORDING`（回退） | 停止中不可重启，须先回到 IDLE |
+| `PROCESSING` → `RECORDING` | 后处理阶段不允许重新开始录音 |
+| `UPLOADING` → `RECORDING` | 上传中不允许录音（资源冲突） |
+| `SLEEP` → 任意状态（除 `INIT`） | 深度睡眠只能通过唤醒+重新 INIT 退出 |
+| 任意状态 → 任意状态（通过 `state_set()` 强制设相同值） | `state_set()` 内会检查，相同状态直接返回 `ESP_OK`，不触发迁移 |
+
+---
+
+## 5. state.h API 设计（配套更新）
+
+```c
+/* 新增状态枚举值 */
+typedef enum {
+    DEVICE_STATE_INIT = 0,
+    DEVICE_STATE_IDLE,
+    DEVICE_STATE_RECORD_ARMED,      /* 新增 */
+    DEVICE_STATE_RECORDING,
+    DEVICE_STATE_RECORD_STOPPING,   /* 新增 */
+    DEVICE_STATE_PROCESSING,        /* 新增 */
+    DEVICE_STATE_UPLOADING,
+    DEVICE_STATE_LOW_BATTERY,       /* 新增 */
+    DEVICE_STATE_ERROR,
+    DEVICE_STATE_SLEEP,
+    DEVICE_STATE_COUNT,
+} device_state_t;
+```
+
+---
+
+## 6. LED 行为总表
+
+| 状态 | 颜色 | 模式 | 频率/说明 |
+|------|------|------|-----------|
+| INIT | 白 | 常亮 | — |
+| IDLE | 绿 | 慢闪 | 1 Hz |
+| RECORD_ARMED | 红 | 快闪 | 5 Hz |
+| RECORDING | 红 | 快闪 | 5 Hz |
+| RECORD_STOPPING | 橙 | 呼吸 | — |
+| PROCESSING | 蓝 | 呼吸（慢） | ~0.5 Hz |
+| UPLOADING | 蓝 | 呼吸（快） | ~1 Hz |
+| LOW_BATTERY | 红 | 慢闪 | 1 Hz |
+| ERROR | 红 | 快闪（错误码） | 10 Hz |
+| SLEEP | 灭 | — | — |
+
+> 注：`RECORD_ARMED` 与 `RECORDING` LED 行为相同，实际中 `RECORD_ARMED` 停留时间极短（< 100ms），肉眼不可区分，无实际问题。
+
+---
+
+## 7. 设计原则
+
+1. **单一入口，单一出口**：每个状态只有一个主要出口条件（`state_set()` 调用点），便于排查。
+2. **不可跳过中间状态**：`RECORDING` → `IDLE` 必须经过 `RECORD_STOPPING`，由 `state.c` 内的迁移 guard 保证（可选实现）。
+3. **ERROR 是唯一"逃生舱"**：任意状态发生异常均可进入 `ERROR`，从 `ERROR` 只能回到 `IDLE`。
+4. **SLEEP 是"终点"**：进入 SLEEP 后相当于系统关闭，唤醒后重新 INIT。
+5. **事件驱动，禁止轮询**：所有状态迁移由事件触发，模块不得循环调用 `state_get()` 判断状态。
+
+---
+
+## 8. 与 event_bus 的交互
+
+```
+[按钮单击]
+  → event_bus_publish(EVENT_BUTTON_CLICKED)
+    → app_main 订阅回调
+      → state_set(DEVICE_STATE_RECORD_ARMED)
+        → event_bus_publish(EVENT_STATE_CHANGED, {INIT→RECORD_ARMED})
+          → recorder 订阅回调：启动 I2S DMA
+          → ui 订阅回调：更新 LED 为红色快闪
+```
+
+状态变化永远通过 `state_set()` 触发，所有模块通过 `EVENT_STATE_CHANGED` 被动响应。
+
+---
+
+*文档版本：v0.3 | 作者：AI Assistant | 审核：待定*
