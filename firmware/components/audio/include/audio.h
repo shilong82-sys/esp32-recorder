@@ -21,6 +21,7 @@
 #include "esp_err.h"
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 /**
  * @brief 初始化 I2S 外设和 INMP441
@@ -57,3 +58,15 @@ int audio_read(int16_t *buffer, size_t samples);
  * @return RMS 值（0.0 ~ 32767.0）
  */
 float audio_calculate_rms(const int16_t *buffer, size_t samples);
+
+/**
+ * @brief Enable/disable ring buffer forwarding
+ *
+ * When enabled, every audio_read() will also send the PCM data
+ * to the ring buffer for consumption by recorder_task.
+ *
+ * Must be called BEFORE recorder_start() to avoid race condition.
+ *
+ * @param enable true = enable ringbuf forwarding, false = disable
+ */
+esp_err_t audio_enable_ringbuf(bool enable);

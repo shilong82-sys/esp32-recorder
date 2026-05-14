@@ -51,8 +51,16 @@
 #endif
 
 /*————————————————————————————
- * Audio 任务：每 100ms 读取一批 PCM 并打印 RMS
- * 验证 INMP441 麦克风采集正常
+ * Audio 任务：唯一 I2S owner，永远运行
+ *
+ * 架构规则：
+ * - audio_task 永远不 suspend/resume
+ * - audio_task 永远拥有 I2S 硬件
+ * - recording state 仅控制是否向 ringbuf 推送数据
+ *
+ * 行为：
+ * - IDLE:      读取 I2S → 计算 RMS（DEBUG log）→ 不写 ringbuf
+ * - RECORDING: 读取 I2S → 计算 RMS → 写入 ringbuf（由 recorder_task 消费）
  *————————————————————————————*/
 #define AUDIO_TASK_PERIOD_MS  (100)      /* 打印间隔 */
 #define AUDIO_TASK_SAMPLES    (1600)      /* 16000Hz × 100ms = 1600 samples */
@@ -80,9 +88,8 @@ static void audio_task(void *arg)
         int got = audio_read(pcm_buf, AUDIO_TASK_SAMPLES);
         if (got > 0) {
             float rms = audio_calculate_rms(pcm_buf, (size_t)got);
-            ESP_LOGI(TAG, "Audio RMS: %.0f", (double)rms);
-        } else {
-            ESP_LOGW(TAG, "Audio RMS: 0 (no data)");
+            /* DEBUG level only — don't spam logs during recording */
+            ESP_LOGD(TAG, "Audio RMS: %.0f", (double)rms);
         }
         vTaskDelay(pdMS_TO_TICKS(AUDIO_TASK_PERIOD_MS));
     }
@@ -113,7 +120,8 @@ static void on_button_event(event_type_t type, const void *data, size_t len, voi
         }
         break;
     case EVENT_BUTTON_DOUBLE_CLICKED:
-        ESP_LOGI(TAG, "[Button] GPIO%d double-clicked", ev->gpio_num);
+        ESP_LOGI(TAG, "[Button] GPIO%d double-clicked — printing storage layout", ev->gpio_num);
+        storage_validate_layout();
         break;
     case EVENT_BUTTON_LONG_PRESSED:
         ESP_LOGI(TAG, "[Button] GPIO%d long pressed", ev->gpio_num);
@@ -130,7 +138,10 @@ static void on_button_event(event_type_t type, const void *data, size_t len, voi
 }
 
 /*————————————————————————————
- * 示例：状态变化处理
+ * 状态变化处理：连接 state machine → recorder
+ * RECORDING → recorder_start() + audio_enable_ringbuf(true)
+ * IDLE     → recorder_stop()  + audio_enable_ringbuf(false)
+ * audio_task 永远运行，永远拥有 I2S
  *————————————————————————————*/
 static void on_state_changed(event_type_t type, const void *data, size_t len, void *user_data)
 {
@@ -140,11 +151,25 @@ static void on_state_changed(event_type_t type, const void *data, size_t len, vo
              state_to_string(ev->prev_state),
              state_to_string(ev->curr_state));
 
-    /* TODO: 在此响应状态变化，如：
-     * - 进入 RECORDING：启动 recorder
-     * - 进入 IDLE：检查待上传文件，触发上传
-     * - 进入 ERROR：显示错误
-     */
+    if (ev->curr_state == DEVICE_STATE_RECORDING && ev->prev_state != DEVICE_STATE_RECORDING) {
+        /* 进入 RECORDING：启用 ringbuf 推送，启动 recorder
+         * audio_task 永远运行，只改变是否向 ringbuf 写数据 */
+        audio_enable_ringbuf(true);
+        esp_err_t ret = recorder_start(NULL);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "recorder_start failed: %s", esp_err_to_name(ret));
+            audio_enable_ringbuf(false);
+            state_set(DEVICE_STATE_IDLE);
+        }
+    }
+    else if (ev->prev_state == DEVICE_STATE_RECORDING && ev->curr_state != DEVICE_STATE_RECORDING) {
+        /* 退出 RECORDING：停止 recorder，禁用 ringbuf 推送
+         * audio_task 继续运行，不受影响 */
+        uint32_t duration_ms = 0;
+        recorder_stop(&duration_ms);
+        audio_enable_ringbuf(false);
+        ESP_LOGI(TAG, "Recording complete: %lu ms", (unsigned long)duration_ms);
+    }
 }
 
 /*————————————————————————————
@@ -164,8 +189,9 @@ void app_main(void)
 
     /* 2. 打印系统信息 */
     ESP_LOGI(TAG, "==========================================");
-    ESP_LOGI(TAG, "  ESP32 AI Recorder");
-    ESP_LOGI(TAG, "  Firmware Runtime Skeleton");
+    ESP_LOGI(TAG, "  ESP32 AI Recorder — v0.2.1 Fix");
+    ESP_LOGI(TAG, "  Phase 1: Recording Closed Loop [FIXED]");
+    ESP_LOGI(TAG, "  Architecture: audio_task = sole I2S owner");
     ESP_LOGI(TAG, "==========================================");
     esp_chip_info_t info;
     esp_chip_info(&info);
@@ -177,23 +203,23 @@ void app_main(void)
              (unsigned long)esp_get_free_heap_size());
 
     /* 3. Event Bus（最先，所有模块依赖）*/
-    ESP_LOGI(TAG, "[1/10] Event Bus ...");
+    ESP_LOGI(TAG, "[1/11] Event Bus ...");
     event_bus_init();
 
     /* 4. State 状态机 */
-    ESP_LOGI(TAG, "[2/10] State ...");
+    ESP_LOGI(TAG, "[2/11] State ...");
     ret = state_init();
     ESP_ERROR_CHECK(ret);
 
     /* 5. LED 硬件初始化 */
-    ESP_LOGI(TAG, "[3/10] LED (GPIO%d) ...", GPIO_LED);
+    ESP_LOGI(TAG, "[3/11] LED (GPIO%d) ...", GPIO_LED);
     ret = led_init(GPIO_LED);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "LED init failed (0x%x)", ret);
     }
 
     /* 6. Button 硬件初始化 */
-    ESP_LOGI(TAG, "[4/10] Button (GPIO%d) ...", GPIO_BUTTON);
+    ESP_LOGI(TAG, "[4/11] Button (GPIO%d) ...", GPIO_BUTTON);
     button_set_long_press_time(1500);
     ret = button_init(GPIO_BUTTON);
     if (ret != ESP_OK) {
@@ -201,32 +227,32 @@ void app_main(void)
     }
 
     /* 7. UI 组件（订阅事件，启动 UI task）*/
-    ESP_LOGI(TAG, "[5/10] UI ...");
+    ESP_LOGI(TAG, "[5/11] UI ...");
     ret = ui_init();
     ESP_ERROR_CHECK(ret);
 
     /* 8. System Monitor（栈/堆监控）*/
-    ESP_LOGI(TAG, "[6/10] System Monitor ...");
+    ESP_LOGI(TAG, "[6/11] System Monitor ...");
     system_monitor_init(10000);  /* 每 10s 打印一次所有任务栈水位线 */
 
-    /* 7. Audio（I2S 麦克风采集验证任务）*/
-    ESP_LOGI(TAG, "[7/10] Audio (INMP441 I2S Mic) ...");
+    /* 7. Audio（I2S 麦克风采集验证任务，永远运行，sole I2S owner）*/
+    ESP_LOGI(TAG, "[7/11] Audio (INMP441 I2S Mic) ...");
     BaseType_t audio_task_created = xTaskCreatePinnedToCore(
         &audio_task,
         "audio",
         AUDIO_TASK_STACK,
         NULL,
         3,      /* priority */
-        NULL,
+        NULL,   /* 不需要保存 handle，禁止 suspend/resume */
         0       /* pin to core 0 */
     );
     if (audio_task_created != pdTRUE) {
         ESP_LOGE(TAG, "audio_task create failed");
     }
 
-    /* 8. Storage TF 卡 */
-    ESP_LOGI(TAG, "[8/10] Storage (SPI mode) ...");
-    ret = storage_mount("/sdcard");
+    /* 8. Storage TF 卡（使用默认挂载点 /sdcard） */
+    ESP_LOGI(TAG, "[8/11] Storage (SPI mode) ...");
+    ret = storage_mount(NULL);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Storage mount OK, testing read/write...");
         esp_err_t test_ret = storage_test_rw();
@@ -243,7 +269,7 @@ void app_main(void)
     }
 
     /* 9. WiFi */
-    ESP_LOGI(TAG, "[9/10] WiFi ...");
+    ESP_LOGI(TAG, "[9/11] WiFi ...");
     wifi_manager_init();
     ret = wifi_manager_restore_connection();
     if (ret == ESP_OK) {
@@ -253,7 +279,7 @@ void app_main(void)
     }
 
     /* 10. Recorder */
-    ESP_LOGI(TAG, "[10/10] Recorder ...");
+    ESP_LOGI(TAG, "[10/11] Recorder ...");
     recorder_config_t rec_cfg = {
         .i2s_port        = I2S_NUM_0,
         .sample_rate     = 16000,
@@ -264,8 +290,8 @@ void app_main(void)
     ret = recorder_init(&rec_cfg);
     ESP_ERROR_CHECK(ret);
 
-    /* 10. Battery */
-    ESP_LOGI(TAG, "[10/11] Battery ...");
+    /* 11. Battery */
+    ESP_LOGI(TAG, "[11/11] Battery ...");
     battery_config_t bat_cfg = {
         .adc_channel     = ADC_CHANNEL_0,
         .adc_atten       = ADC_ATTEN_DB_12,

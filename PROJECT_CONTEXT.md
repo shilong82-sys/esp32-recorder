@@ -187,11 +187,13 @@ These rules apply to any AI agent (ChatGPT, Claude, Copilot, Cursor, etc.) worki
 
 1. Read `PROJECT_CONTEXT.md` (this file)
 2. Read `docs/architecture.md` for system design
-3. Read `docs/state-machine.md` for state transitions
-4. Read `docs/pinout.md` for frozen GPIO assignments
-5. Read `docs/coding-style.md` for naming and style conventions
-6. Read `docs/todo.md` for current task list
-7. Read `docs/bugs.md` for known issues
+3. Read `docs/expansion-architecture.md` for future capability planning
+4. Read `docs/platform-reservation.md` for long-term resource reservation
+5. Read `docs/state-machine.md` for state transitions
+6. Read `docs/pinout.md` for frozen GPIO assignments
+7. Read `docs/coding-style.md` for naming and style conventions
+8. Read `docs/todo.md` for current task list
+9. Read `docs/bugs.md` for known issues
 
 ### What NOT to Do Without Asking
 
@@ -217,7 +219,66 @@ These rules apply to any AI agent (ChatGPT, Claude, Copilot, Cursor, etc.) worki
 
 ---
 
-## 10. Known Issues
+## 12. Platform Expansion Philosophy
+
+> **What this device is becoming — and how we get there without breaking it.**
+
+### 12.1 From Recorder to Platform
+
+This project started as a **voice recorder** (ESP32 + mic + SD card). It is evolving into an **AI Voice Terminal Platform** — a programmable, extensible voice interaction node that can grow from a simple recorder into a full AI assistant over 2–3 years.
+
+The four phases of evolution:
+
+| Phase | Name | Core Capability | Status |
+|-------|------|----------------|--------|
+| Phase 1 | Voice Recorder | Single-button WAV recording | ✅ Done |
+| Phase 2 | Offline AI Memory | Upload + Whisper transcription | v0.2–v0.4 |
+| Phase 3 | PTT AI Assistant | Speaker + TTS + push-to-talk | Future |
+| Phase 4 | Continuous Voice Agent | 4G + GPS + camera | Future |
+
+### 12.2 How We Expand: The Three Rules
+
+| Rule | Meaning |
+|------|---------|
+| **Platform first, features second** | Before adding any new capability, verify the platform supports it (GPIO, power, thermal, bus) |
+| **One layer at a time** | Do not implement audio output and 4G in the same release cycle |
+| **Architecture before runtime** | Every future capability must be documented in `docs/expansion-architecture.md` and `docs/platform-reservation.md` before any code is written |
+
+### 12.3 What We Do NOT Do Now
+
+The following are **explicitly not in scope** for current development:
+
+- Speaker / audio output (reserved for Phase 3)
+- 4G / cellular connectivity (reserved for Phase 3)
+- Camera (reserved for Phase 4)
+- TFT display (reserved for Phase 2)
+- Wake word engine (reserved for Phase 2)
+
+These are **architecture-reserved** — we define the space they will occupy, but we do not implement them until the current phase is stable.
+
+### 12.4 Staged Complexity Philosophy
+
+> **Complexity must evolve incrementally. A platform that tries to do everything at once does nothing well.**
+
+We follow this sequence:
+
+1. **Verify stable** — current system builds, runs, and passes all tests
+2. **Document the plan** — write `docs/expansion-architecture.md` before writing any code
+3. **Reserve the resources** — update `docs/platform-reservation.md` and `docs/pinout.md`
+4. **Implement in isolation** — new component does not touch existing working code
+5. **Integrate incrementally** — add one new component at a time, verify stability after each
+
+### 12.5 Key Documents
+
+| Document | Purpose |
+|----------|---------|
+| `docs/expansion-architecture.md` | Defines future capability layers and expansion strategy |
+| `docs/platform-reservation.md` | Hard rules for GPIO, bus, power, thermal, RF, and connector reservation |
+| `docs/pinout.md` | Current and reserved GPIO assignments (frozen) |
+
+---
+
+## 13. Known Issues
 
 | ID   | Severity | Component | Description                                    | Workaround                     |
 |------|----------|-----------|------------------------------------------------|--------------------------------|
@@ -237,6 +298,8 @@ esp32-recorder/
 ├── README.md
 ├── docs/                       ← All project documentation
 │   ├── architecture.md
+│   ├── expansion-architecture.md  ← Platform expansion planning
+│   ├── platform-reservation.md     ← Long-term resource reservation rules
 │   ├── hardware.md
 │   ├── pinout.md
 │   ├── state-machine.md
@@ -257,5 +320,5 @@ esp32-recorder/
 
 ---
 
-*Last updated: 2026-05-12*
+*Last updated: 2026-05-13*
 *Maintained by: AI engineering agent + shilong82-sys*

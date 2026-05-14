@@ -107,12 +107,13 @@ static esp_err_t upload_single_file(const char *file_path)
     snprintf(url, sizeof(url), "http://%s:%d%s",
              s_config.server_ip, s_config.server_port, s_config.upload_path);
 
-    // 打开本地文件
+    // 构建 VFS 路径（使用 storage API，禁止硬编码 "/sdcard"）
     char full_path[128];
-    if (file_path[0] == '/') {
-        snprintf(full_path, sizeof(full_path), "/sdcard%s", file_path);
-    } else {
-        snprintf(full_path, sizeof(full_path), "/sdcard/%s", file_path);
+    esp_err_t path_err = storage_build_vfs_path(full_path, sizeof(full_path),
+                                            STORAGE_PATH_RECORDINGS, file_path);
+    if (path_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to build VFS path for: %s", file_path);
+        return path_err;
     }
 
     FILE *fp = fopen(full_path, "rb");

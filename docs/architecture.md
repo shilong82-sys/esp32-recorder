@@ -1,6 +1,6 @@
 # Architecture — ESP32 AI Recorder
 
-> Version: v0.2 | Updated: 2026-05-12
+> Version: v0.3 | Updated: 2026-05-14
 
 ---
 
@@ -55,17 +55,17 @@
 | `event_bus`    | components/event_bus/               | Global pub/sub event broker               | ✅ Done   |
 | `state`        | components/state/                   | Device FSM, broadcasts state changes      | ✅ Done   |
 | `system_monitor` | components/system_monitor/        | FreeRTOS task stack watermark reporter    | ✅ Done   |
-| `ui`           | components/ui/                      | LED pattern controller, event-driven      | ✅ Done   |
-| `audio`        | components/audio/                   | INMP441 I2S reader, RMS monitor           | ✅ Done   |
-| `led`          | components/led/                     | WS2812B RMT driver, low-level            | ✅ Done   |
-| `button`       | components/button/                  | GPIO debounce, click/long-press detection | ✅ Done   |
-| `storage`      | components/storage/                 | SPI TF card, FAT32 mount/read/write       | ✅ Done   |
-| `battery`      | components/battery/                 | ADC voltage → percentage, events          | ✅ Done   |
-| `recorder`     | components/recorder/                | WAV file pipeline (stub → real in v0.2)   | ⚠️ Stub   |
-| `uploader`     | components/uploader/                | HTTP upload to Mac server (stub → v0.3)  | ⚠️ Stub   |
-| `wifi_manager` | components/wifi_manager/            | WiFi STA, NVS credentials, reconnect     | ✅ Done   |
-| `logger`       | components/logger/                  | Structured log helper                     | ✅ Done   |
-| `rgb_led`      | components/rgb_led/                 | (Legacy; use `led` component instead)    | ⚠️ Legacy |
+| `ui`           | components/ui/                     | LED pattern controller, event-driven      | ✅ Done   |
+| `audio`        | components/audio/                  | INMP441 I2S reader, RMS monitor           | ✅ Done   |
+| `led`          | components/led/                    | WS2812B RMT driver, low-level            | ✅ Done   |
+| `button`       | components/button/                 | GPIO debounce, click/long-press detection | ✅ Done   |
+| `storage`      | components/storage/                | SPI TF card, FAT32 mount, directory lifecycle | ✅ Done |
+| `battery`      | components/battery/                | ADC voltage → percentage, events          | ✅ Done   |
+| `recorder`     | components/recorder/               | WAV file pipeline (write-only, no dirs)   | ✅ Done   |
+| `uploader`     | components/uploader/               | HTTP upload to Mac server (stub → v0.3)  | ⚠️ Stub   |
+| `wifi_manager` | components/wifi_manager/           | WiFi STA, NVS credentials, reconnect      | ✅ Done   |
+| `logger`       | components/logger/                | Structured log helper                     | ✅ Done   |
+| `rgb_led`      | components/rgb_led/               | (Legacy; use `led` component instead)    | ⚠️ Legacy |
 
 ---
 
@@ -104,19 +104,19 @@ button.c
 ```c
 // app_main.c — boot order (must not be changed without review)
 1.  nvs_flash_init()
-2.  event_bus_init()          // MUST be first — all modules depend on it
-3.  state_init()              // INIT state
+2.  event_bus_init()              // MUST be first — all modules depend on it
+3.  state_init()                  // INIT state
 4.  led_init(GPIO_NUM_48)
 5.  button_init(GPIO_NUM_0)
 6.  ui_init()
 7.  system_monitor_init(10000)
-8.  xTaskCreatePinnedToCore(audio_task, ...)  // core 0
-9.  storage_mount("/sdcard")
+8.  xTaskCreatePinnedToCore(audio_task, ...)   // core 0
+9.  storage_mount("/sdcard")    // → storage_ensure_directories() + storage_validate_layout()
 10. wifi_manager_init() + wifi_manager_restore_connection()
-11. recorder_init()
+11. recorder_init()              // sessions scanned from 0:/recordings/
 12. battery_init()
 13. uploader_init()
-14. event_bus_subscribe(...)   // register app-level event handlers
+14. event_bus_subscribe(...)     // register app-level event handlers
 15. state_set(DEVICE_STATE_IDLE)
 ```
 
@@ -124,10 +124,11 @@ button.c
 
 ## 5. FreeRTOS Task Layout
 
-| Task Name        | Stack  | Priority | Core | Description                      |
-|------------------|--------|----------|------|----------------------------------|
-| `audio`          | 8192 B | 3        | 0    | I2S read + RMS print (100ms)     |
-| `sys_monitor`    | ~2048 B| 1        | any  | Stack watermark every 10s        |
+| Task Name        | Stack  | Priority | Core | Description                                   |
+|------------------|--------|----------|------|-----------------------------------------------|
+| `audio`          | 8192 B | 3        | 0    | I2S read + RMS + ringbuf (always running)     |
+| `recorder`       | 8192 B | 3        | 0    | Ringbuf → WAV file (always running)           |
+| `sys_monitor`    | ~2048 B| 1        | any  | Stack watermark every 10s                    |
 | `wifi` (internal)| ESP-IDF| varies   | any  | ESP-IDF WiFi stack               |
 | `button_task`    | ~2048 B| 5        | any  | Button debounce timer (internal) |
 
@@ -139,12 +140,18 @@ button.c
 
 ```
 /sdcard/
-├── records/        ← recorded WAV files (REC_YYYYMMDD_HHMMSS.wav)
-├── pending/        ← upload queue (JSON task descriptors) [future]
-├── done/           ← uploaded files [future]
-├── logs/           ← on-device logs [future]
-└── test.txt        ← R/W test file (created at boot, safe to delete)
+├── recordings/        ← WAV files (REC_SESSION_XXXX.wav)
+│                       Created + validated by storage.c (NOT recorder.c)
+├── uploaded/          ← Uploaded files (auto-created)
+├── upload_queue/      ← Upload task queue (auto-created)
+├── temp/              ← Temporary files (auto-created)
+├── logs/              ← On-device logs (auto-created)
+└── test.txt           ← R/W test file (created at boot)
 ```
+
+**Directory ownership: storage.c owns all directory lifecycle operations.
+recorder.c only writes WAV files via fopen() — it never calls f_mkdir/f_opendir.
+See docs/storage-path-policy.md for path strategy details.**
 
 ---
 

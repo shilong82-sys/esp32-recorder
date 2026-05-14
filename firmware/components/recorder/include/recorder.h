@@ -1,12 +1,14 @@
 /**
  * @file recorder.h
- * @brief I2S 麦克风录音模块 - 头文件
+ * @brief Recorder component - WAV recording from I2S microphone
  *
- * 功能：
- * - I2S 麦克风驱动（INMP441 / SPH0645 等）
- * - WAV 文件生成（写入 TF 卡）
- * - 录音启停控制
- * - 音频参数配置（采样率、位深、声道）
+ * The recorder reads audio from a ring buffer (populated by audio.c)
+ * and writes it to SD card as WAV files.
+ *
+ * Architecture:
+ * - audio.c reads from I2S and sends to ringbuf
+ * - recorder.c's recorder_task reads from ringbuf and writes WAV to SD
+ * - recorder_start/stop control recording via the state machine
  */
 
 #ifndef RECORDER_H
@@ -19,49 +21,73 @@
 #include <stdbool.h>
 
 /**
- * @brief 录音参数配置结构体
+ * @brief Recorder configuration (currently uses fixed settings)
  */
 typedef struct {
-    i2s_port_t i2s_port;       /*!< I2S 端口号 */
-    uint32_t sample_rate;          /*!< 采样率（16000 / 44100 / 48000）*/
-    uint8_t bits_per_sample;       /*!< 位深（16 / 24 / 32）*/
-    uint8_t channel_format;        /*!< 声道格式 */
-    char file_prefix[32];         /*!< 文件名前缀 */
+    i2s_port_t i2s_port;        /**< I2S port (unused — audio.c owns I2S) */
+    uint32_t sample_rate;        /**< Sample rate in Hz (default: 16000) */
+    uint8_t bits_per_sample;     /**< Bits per sample (default: 16) */
+    uint8_t channel_format;       /**< Channels (default: 1 = mono) */
+    char file_prefix[32];         /**< File prefix (unused in Phase 1 — session-based) */
 } recorder_config_t;
 
 /**
- * @brief 初始化录音模块
- * @param config 录音参数配置
- * @return esp_err_t
+ * @brief Initialize the recorder component
+ *
+ * Creates the recorder task, initializes ring buffer, and sets up session counter.
+ *
+ * @param config Configuration (NULL = use defaults)
+ * @return ESP_OK on success
  */
 esp_err_t recorder_init(const recorder_config_t *config);
 
 /**
- * @brief 开始录音
- * @param filename 输出 WAV 文件路径（NULL = 自动生成）
- * @return esp_err_t
+ * @brief Start recording
+ *
+ * Opens a new WAV file, writes header, and starts accumulating audio.
+ * Filename is auto-generated as REC_SESSION_XXXX.wav.
+ *
+ * @param filename Optional full path override (NULL = auto-generate)
+ * @return ESP_OK on success
  */
 esp_err_t recorder_start(const char *filename);
 
 /**
- * @brief 停止录音
- * @param[out] out_duration_ms 录音时长（毫秒）
- * @return esp_err_t
+ * @brief Stop recording
+ *
+ * Flushes remaining ring buffer data, updates WAV header with correct sizes,
+ * closes the file, and publishes EVENT_RECORDING_STOPPED.
+ *
+ * @param[out] out_duration_ms Duration in milliseconds (may be NULL)
+ * @return ESP_OK on success
  */
 esp_err_t recorder_stop(uint32_t *out_duration_ms);
 
 /**
- * @brief 获取当前录音状态
- * @return true=录音中, false=空闲
+ * @brief Check if recording is in progress
+ *
+ * @return true if recording, false otherwise
  */
 bool recorder_is_recording(void);
 
 /**
- * @brief 获取录音文件列表（TF 卡）
- * @param[out] file_list 文件列表缓冲区
- * @param max_files 最大文件数
- * @return 实际文件数
+ * @brief Enable or disable ring buffer forwarding
+ *
+ * Called by app_main before starting/stopping recording to ensure
+ * the audio pipeline is in the right mode.
+ *
+ * @param enable true = enable, false = disable
+ * @return ESP_OK
+ */
+esp_err_t recorder_enable_ringbuf(bool enable);
+
+/**
+ * @brief List all WAV files in /sdcard/recordings/
+ *
+ * @param[out] file_list Array of filename strings (64 chars each)
+ * @param max_files Maximum number of filenames to return
+ * @return Number of files found
  */
 int recorder_list_files(char file_list[][64], int max_files);
 
-#endif // RECORDER_H
+#endif /* RECORDER_H */

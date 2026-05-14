@@ -25,6 +25,7 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "ringbuf.h"
 #include <math.h>
 #include <string.h>
 
@@ -64,6 +65,9 @@ static i2s_chan_handle_t s_rx_handle = NULL;
 /* PCM 输出 buffer（每帧 4 字节 I2S 总线数据） */
 static uint8_t s_i2s_buf[DMA_DESC_NUM * DMA_FRAME_NUM * sizeof(uint32_t)]
     __attribute__((aligned(4)));
+
+/* Ring buffer forwarding state (set by audio_enable_ringbuf) */
+static volatile bool s_ringbuf_enabled = false;
 
 /*======================================================================
  * I2S 总线数据 → Mono PCM 转换
@@ -224,6 +228,11 @@ int audio_read(int16_t *buffer, size_t samples)
         buffer[copied++] = extract_mono_sample(i2s_words[i]);
     }
 
+    /* Forward to ring buffer if enabled (for recording) */
+    if (s_ringbuf_enabled && copied > 0) {
+        ringbuf_send(buffer, copied);
+    }
+
     return (int)copied;
 }
 
@@ -242,4 +251,14 @@ float audio_calculate_rms(const int16_t *buffer, size_t samples)
         sum += v * v;
     }
     return (float)sqrt(sum / (double)samples);
+}
+
+/*======================================================================
+ * audio_enable_ringbuf
+ *======================================================================*/
+esp_err_t audio_enable_ringbuf(bool enable)
+{
+    s_ringbuf_enabled = enable;
+    ESP_LOGI(TAG, "Ring buffer forwarding %s", enable ? "ENABLED" : "DISABLED");
+    return ESP_OK;
 }
