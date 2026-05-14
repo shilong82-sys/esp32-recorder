@@ -251,8 +251,8 @@ static void recorder_task(void *arg)
 
         /* Write to batch buffer (accumulate) */
         if (s_rec.file != NULL) {
-            size_t written = fwrite(read_buf, got * sizeof(int16_t), 1, s_rec.file);
-            if (written != 1) {
+            size_t written = fwrite(read_buf, sizeof(int16_t), got, s_rec.file);
+            if (written != got) {
                 s_stats.write_failures++;
                 ESP_LOGE(TAG, "fwrite failed (errno=%d)", errno);
             } else {
@@ -431,7 +431,7 @@ esp_err_t recorder_stop(uint32_t *out_duration_ms)
         size_t got = ringbuf_receive(drain_buf, RECORDER_READ_SAMPLES, 50);
         if (got == 0) break;
         if (s_rec.file != NULL) {
-            fwrite(drain_buf, got * sizeof(int16_t), 1, s_rec.file);
+            fwrite(drain_buf, sizeof(int16_t), got, s_rec.file);
             s_rec.total_samples += got;
         }
         drain_count++;

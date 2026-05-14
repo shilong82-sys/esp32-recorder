@@ -40,7 +40,6 @@
 #include "uploader.h"
 #include "logger.h"
 #include "audio.h"
-#include "esp_adc/adc_oneshot.h"
 
 /* 测试硬件引脚定义 */
 #ifndef GPIO_LED
