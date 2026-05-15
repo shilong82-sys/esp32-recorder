@@ -9,8 +9,8 @@
 | Version | Status      | Summary                              |
 |---------|-------------|--------------------------------------|
 | v0.1    | ✅ Complete | Hardware bring-up                    |
-| v0.2    | 🔨 Current  | WAV recording pipeline               |
-| v0.3    | Planned     | WiFi upload pipeline                 |
+| v0.2    | ✅ Complete | WAV recording pipeline               |
+| v0.3    | 🔨 Current  | WiFi upload pipeline                 |
 | v0.4    | Planned     | AI transcription integration         |
 | v0.5    | Planned     | Power optimization                   |
 | v0.6    | Future      | Production polish                    |
@@ -38,44 +38,42 @@
 
 ---
 
-## v0.2 — WAV Recording Pipeline 🔨 In Progress
+## v0.2 — WAV Recording Pipeline ✅ Complete
 
 **Goal:** Real audio capture → WAV file on SD card.
 
-- [ ] Wire `audio` component into `recorder` component
+- [x] Wire `audio` component into `recorder` component
   - `audio_read()` → ring buffer → WAV write
-- [ ] Implement WAV file creation with correct RIFF header
-- [ ] Implement WAV file streaming write (no large RAM buffer)
-- [ ] Update WAV header (file size, data chunk size) on `recorder_stop()`
-- [ ] File naming: `REC_YYYYMMDD_HHMMSS.wav` using `esp_timer`
-- [ ] Event integration: publish `EVENT_RECORDING_STARTED` / `STOPPED`
-- [ ] State integration: IDLE → RECORDING → IDLE via button
-- [ ] SD card space check before starting recording
-- [ ] Test: verify WAV file is playable on Mac
-
-**Key files to modify:**
-- `firmware/components/recorder/recorder.c`
-- `firmware/components/recorder/include/recorder.h`
-- `firmware/main/app_main.c` (wire state changes to recorder calls)
+- [x] Implement WAV file creation with correct RIFF header
+- [x] Implement WAV file streaming write (no large RAM buffer)
+- [x] Update WAV header (file size, data chunk size) on `recorder_stop()`
+- [x] File naming: `REC_SESSION_XXXX.wav` using session counter
+- [x] Event integration: publish `EVENT_RECORDING_STARTED` / `STOPPED`
+- [x] State integration: IDLE → RECORDING → IDLE via button
+- [x] SD card space check before starting recording
+- [x] Test: verify WAV file is playable on Mac
+- [x] Stable-state directory architecture (recordings/ → upload_queue/)
 
 ---
 
-## v0.3 — WiFi Upload Pipeline
+## v0.3 — WiFi Upload Pipeline 🔨 In Progress
 
 **Goal:** Automatically upload recorded WAV files to Mac server.
 
-- [ ] Implement `uploader_upload_file()` — HTTP POST multipart
-- [ ] Upload queue: scan SD card for `.wav` files pending upload
-- [ ] Event integration: trigger upload on `EVENT_RECORDING_STOPPED`
-- [ ] Progress reporting: `EVENT_UPLOAD_PROGRESS`
-- [ ] Retry logic: 3 retries with exponential backoff
-- [ ] Move uploaded files to `/sdcard/done/`
-- [ ] Handle WiFi disconnect during upload
-- [ ] Server: receive file, save, return transcript
+**Architecture:** Stable-state upload queue (producer-consumer)
+- `recordings/` → recorder writes finalized WAV → rename → `upload_queue/`
+- `upload_queue/` → uploader_task (独立 FreeRTOS task) scans FIFO → HTTP POST → rename → `uploaded/`
+- `uploaded/` → 归档，不 delete
 
-**Key files to modify:**
-- `firmware/components/uploader/uploader.c`
-- `firmware/server/app.py`
+- [x] `storage_rename_file()` — 跨目录 move
+- [x] `storage_delete_file_vfs()` — 任意相对路径删除
+- [x] recorder_stop flow: flush WAV → finalize header → fclose → rename upload_queue/
+- [x] uploader_task 独立任务：周期扫描、FIFO 上传、重试（3s/10s/30s）、归档 rename
+- [x] WiFi 断开/恢复事件：自动暂停/继续上传
+- [x] WiFi 事件回调系统（wifi_manager_register_callback）
+- [ ] Retry 失败文件保留在队列，等待下一轮
+- [ ] WiFi 断开期间录音不受影响
+- [ ] 固件烧录验证
 
 ---
 
