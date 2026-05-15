@@ -125,50 +125,136 @@ static void wav_finalize(FILE *f, uint32_t total_samples)
 static int s_next_session_id = 0;
 
 /**
- * Scan recordings/ directory for existing REC_SESSION_XXXX.wav files.
- * Set s_next_session_id to max found + 1.
+ * Scan a single directory for the highest REC_SESSION_XXXX.wav id.
+ * Returns the max id found, or 0 if none.
  *
  * Uses opendir()/readdir() (POSIX/VFS) via storage_build_vfs_path().
- * Directory is guaranteed to exist by storage_ensure_directories() at mount time.
- * recorder.c does NOT create directories — storage owns directory lifecycle.
- * See docs/storage-path-policy.md.
  */
-static void session_init(void)
+static int session_scan_dir(storage_path_type_t type)
 {
-    /* Build VFS path: "/sdcard/recordings" */
     char vfs_path[64];
-    storage_build_vfs_path(vfs_path, sizeof(vfs_path),
-                             STORAGE_PATH_RECORDINGS, NULL);
+    if (storage_build_vfs_path(vfs_path, sizeof(vfs_path), type, NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "session_scan_dir: build path failed for type=%d", type);
+        return 0;
+    }
 
     DIR *dir = opendir(vfs_path);
     if (dir == NULL) {
-        /* Directory missing — this should not happen if storage_mount() succeeded.
-         * Log error but don't crash; session numbering will start at 0001. */
-        ESP_LOGE(TAG, "session_init: opendir(%s) failed: %d", vfs_path, errno);
-        ESP_LOGE(TAG, "  Directory may be missing — run storage_validate_layout()");
-        s_next_session_id = 1;
-        return;
+        /* Directory may not exist yet — not an error */
+        ESP_LOGD(TAG, "session_scan_dir: opendir(%s) failed: %d (%s)",
+                 vfs_path, errno, strerror(errno));
+        return 0;
     }
 
-    /* Scan for existing session files */
     int max_id = 0;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
             continue;
         }
-        /* Look for REC_SESSION_XXXX.wav pattern */
         unsigned int id = 0;
-        if (sscanf(entry->d_name, "REC_SESSION_%4u.wav", &id) == 1) {
+        /* Match REC_SESSION_XXXX.wav or REC_SESSION_XXXX_1.wav */
+        if (sscanf(entry->d_name, "REC_SESSION_%4u%*[.]wav", &id) == 1 ||
+            sscanf(entry->d_name, "REC_SESSION_%4u_%*u.wav", &id) == 1) {
             if ((int)id > max_id) {
                 max_id = (int)id;
             }
         }
     }
     closedir(dir);
+    return max_id;
+}
 
-    s_next_session_id = max_id + 1;
-    ESP_LOGI(TAG, "Session counter initialized: next = %04d", s_next_session_id);
+/**
+ * Scan recordings/, upload_queue/, and uploaded/ directories for existing
+ * REC_SESSION_XXXX.wav files. Set s_next_session_id to max found + 1.
+ *
+ * This ensures session ids never collide after:
+ * - Device restart with files in upload_queue/
+ * - Files archived to uploaded/
+ * - High-frequency start/stop cycles
+ */
+static void session_init(void)
+{
+    int max_recordings  = session_scan_dir(STORAGE_PATH_RECORDINGS);
+    int max_queue       = session_scan_dir(STORAGE_PATH_UPLOAD_QUEUE);
+    int max_uploaded    = session_scan_dir(STORAGE_PATH_UPLOADED);
+
+    int max_all = max_recordings;
+    if (max_queue    > max_all) max_all = max_queue;
+    if (max_uploaded > max_all) max_all = max_uploaded;
+
+    s_next_session_id = max_all + 1;
+
+    ESP_LOGI(TAG, "[SESSION] init: recordings_max=%04d queue_max=%04d uploaded_max=%04d",
+             max_recordings, max_queue, max_uploaded);
+    ESP_LOGI(TAG, "[SESSION] next session id = %04d", s_next_session_id);
+}
+
+/**
+ * Check if a file exists in a given storage path directory.
+ */
+static bool file_exists_in_dir(storage_path_type_t type, const char *filename)
+{
+    char vfs_path[128];
+    if (storage_build_vfs_path(vfs_path, sizeof(vfs_path), type, filename) != ESP_OK) {
+        return false;
+    }
+    struct stat st;
+    return (stat(vfs_path, &st) == 0 && S_ISREG(st.st_mode));
+}
+
+/**
+ * Generate a safe filename for upload_queue.
+ *
+ * If REC_SESSION_xxxx.wav already exists in upload_queue/,
+ * auto-generate REC_SESSION_xxxx_1.wav, _2.wav, etc.
+ *
+ * @param base_name     The original filename (e.g., "REC_SESSION_0013.wav")
+ * @param out_safe      Output buffer for the safe filename
+ * @param out_size      Size of output buffer
+ * @return true = safe filename generated (may be same as input or with _N suffix)
+ */
+static bool session_get_safe_queue_name(const char *base_name,
+                                        char *out_safe, size_t out_size)
+{
+    if (out_size < 64) {
+        return false;
+    }
+
+    /* Check if base name already exists */
+    if (!file_exists_in_dir(STORAGE_PATH_UPLOAD_QUEUE, base_name)) {
+        snprintf(out_safe, out_size, "%s", base_name);
+        return true;
+    }
+
+    /* Extract base id: "REC_SESSION_0013.wav" -> id = 13 */
+    unsigned int base_id = 0;
+    if (sscanf(base_name, "REC_SESSION_%4u.wav", &base_id) != 1) {
+        /* Fallback: just append _1 */
+        snprintf(out_safe, out_size, "%.*s_1.wav",
+                 (int)(strlen(base_name) - 4), base_name);
+        return true;
+    }
+
+    /* Try _1, _2, ... until we find an unused name */
+    for (unsigned int suffix = 1; suffix <= 999; suffix++) {
+        char candidate[64];
+        snprintf(candidate, sizeof(candidate),
+                 "REC_SESSION_%04u_%u.wav", base_id, suffix);
+
+        if (!file_exists_in_dir(STORAGE_PATH_UPLOAD_QUEUE, candidate)) {
+            ESP_LOGW(TAG, "[SESSION] target exists in upload_queue: %s -> using %s",
+                     base_name, candidate);
+            snprintf(out_safe, out_size, "%s", candidate);
+            return true;
+        }
+    }
+
+    /* Should never reach here, but fallback to _1 */
+    snprintf(out_safe, out_size, "%.*s_1.wav",
+             (int)(strlen(base_name) - 4), base_name);
+    return true;
 }
 
 /**
@@ -456,20 +542,30 @@ esp_err_t recorder_stop(uint32_t *out_duration_ms)
     /*
      * Step: Move to upload_queue
      * Only after fclose() confirms file is finalized on disk.
+     *
      * Rename failure → log error but do NOT crash; file stays in recordings/.
      * The uploader startup scan covers both upload_queue/ and recordings/.
      */
-    const char *filename = strrchr(s_rec.filepath, '/');
-    filename = filename ? filename + 1 : s_rec.filepath;
+    const char *src_filename = strrchr(s_rec.filepath, '/');
+    src_filename = src_filename ? src_filename + 1 : s_rec.filepath;
+
+    /* Get safe filename for upload_queue (auto-rename if collision) */
+    char safe_queue_name[64];
+    session_get_safe_queue_name(src_filename, safe_queue_name, sizeof(safe_queue_name));
+
+    ESP_LOGI(TAG, "[QUEUE] src=%s queue_target=%s", src_filename, safe_queue_name);
+
     esp_err_t rename_err = storage_rename_file(
-        STORAGE_PATH_RECORDINGS, filename,
-        STORAGE_PATH_UPLOAD_QUEUE, filename);
+        STORAGE_PATH_RECORDINGS, src_filename,
+        STORAGE_PATH_UPLOAD_QUEUE, safe_queue_name);
+
     if (rename_err != ESP_OK) {
-        ESP_LOGE(TAG, "[QUEUE] rename to upload_queue FAILED (%s) — file stays in recordings/",
+        ESP_LOGE(TAG, "[QUEUE] rename FAILED (%s) — file stays in recordings/",
                  esp_err_to_name(rename_err));
-        ESP_LOGE(TAG, "[QUEUE] filename: %s", filename);
+        ESP_LOGE(TAG, "[QUEUE] src=%s target=%s errno=%d",
+                 src_filename, safe_queue_name, errno);
     } else {
-        ESP_LOGI(TAG, "[QUEUE] -> upload_queue/%s", filename);
+        ESP_LOGI(TAG, "[QUEUE] queued: upload_queue/%s", safe_queue_name);
     }
 
     /* Calculate duration */
@@ -482,6 +578,7 @@ esp_err_t recorder_stop(uint32_t *out_duration_ms)
 
     ESP_LOGI(TAG, "Recording stopped");
     ESP_LOGI(TAG, "  File: %s", s_rec.filepath);
+    ESP_LOGI(TAG, "  Queue: upload_queue/%s", safe_queue_name);
     ESP_LOGI(TAG, "  Duration: %lu ms", (unsigned long)duration_ms);
     ESP_LOGI(TAG, "  Total samples: %lu", (unsigned long)s_rec.total_samples);
     ESP_LOGI(TAG, "  File size: %lu bytes", (unsigned long)(s_rec.total_samples * 2 + WAV_HEADER_SIZE));
