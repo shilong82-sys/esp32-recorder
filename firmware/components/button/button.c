@@ -1,8 +1,11 @@
 /**
  * @file button.c
- * @brief 按键控制模块 - 源文件（Event 版）
+ * @brief 按键控制模块 - 源文件（Task 分离版）
  *
- * 按键事件通过 event_bus 广播，不再依赖直接回调。
+ * 架构原则：
+ * - esp_timer callback (polling_callback) 只做 GPIO 读取和状态更新
+ * - 所有业务逻辑（publish_event）都在 button_task 中执行
+ * - 两者通过事件队列解耦
  *
  * 事件分发：
  *   按下          → EVENT_BUTTON_PRESSED
@@ -17,6 +20,8 @@
 #include "event_bus.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 
 static const char *TAG = "button";
@@ -47,15 +52,43 @@ typedef struct {
     bool         last_level;
 } button_info_t;
 
-/* 全局状态 */
+/* ============================================================
+ * 任务分离：button 事件队列
+ *
+ * polling_callback 将检测到的事件放入此队列
+ * button_task 从队列中取出并通过 event_bus 发布
+ * ============================================================ */
+#define BTN_EVT_QUEUE_SIZE  16
+
+typedef enum {
+    BTN_EVT_NONE = 0,
+    BTN_EVT_PRESSED,
+    BTN_EVT_RELEASED,
+    BTN_EVT_CLICKED,
+    BTN_EVT_DOUBLE_CLICKED,
+    BTN_EVT_LONG_PRESSED,
+    BTN_EVT_HOLD,
+} btn_evt_type_t;
+
+typedef struct {
+    btn_evt_type_t type;
+    gpio_num_t     gpio;
+} btn_evt_t;
+
+static QueueHandle_t s_evt_queue = NULL;
+static TaskHandle_t  s_btn_task = NULL;
+
+/* ============================================================
+ * 全局状态（供 polling_callback 和 button_task 共享）
+ * ============================================================ */
 static button_info_t   s_buttons[MAX_BUTTONS] = {0};
 static int             s_button_count         = 0;
 static esp_timer_handle_t s_polling_timer     = NULL;
 static uint32_t        s_long_press_ms        = LONG_PRESS_DEFAULT_MS;
 
 /* 内部事件队列（兼容 button_get_event 旧接口）*/
-#define EVT_QUEUE_SIZE  16
-static button_event_t  s_evt_queue[EVT_QUEUE_SIZE];
+#define BTN_LEGACY_EVT_QUEUE_SIZE  16
+static button_event_t  s_legacy_evt_queue[BTN_LEGACY_EVT_QUEUE_SIZE];
 static int             s_evt_head = 0;
 static int             s_evt_tail = 0;
 
@@ -63,9 +96,32 @@ static int             s_evt_tail = 0;
 static uint64_t        s_last_click_ms     = 0;
 static bool            s_waiting_double    = false;
 
-/*————————————————————————————
+/* Forward declaration for esp_timer callback */
+static void polling_callback(void *arg);
+
+/* ============================================================
+ * 内部：向 button_task 发送事件
+ * ============================================================ */
+static void send_evt_to_task(btn_evt_type_t type, gpio_num_t gpio)
+{
+    if (s_evt_queue == NULL) return;
+
+    btn_evt_t evt = {
+        .type = type,
+        .gpio = gpio,
+    };
+
+    /* 非阻塞发送，超时则丢弃（避免阻塞 esp_timer）*/
+    BaseType_t woken = pdFALSE;
+    xQueueSendFromISR(s_evt_queue, &evt, &woken);
+    if (woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+/* ============================================================
  * 内部：向 event_bus 发布按键数据
- *————————————————————————————*/
+ * ============================================================ */
 static void publish_event(event_type_t type, gpio_num_t gpio)
 {
     event_button_data_t data = {
@@ -74,21 +130,81 @@ static void publish_event(event_type_t type, gpio_num_t gpio)
     event_bus_publish(type, &data, sizeof(data));
 }
 
-/*————————————————————————————
+/*----------------------------
  * 内部：向内部事件队列推入事件（button_get_event 兼容）
- *————————————————————————————*/
+ *----------------------------*/
 static void push_event(button_event_t ev)
 {
-    int next = (s_evt_head + 1) % EVT_QUEUE_SIZE;
+    int next = (s_evt_head + 1) % BTN_LEGACY_EVT_QUEUE_SIZE;
     if (next != s_evt_tail) {
-        s_evt_queue[s_evt_head] = ev;
+        s_legacy_evt_queue[s_evt_head] = ev;
         s_evt_head = next;
     }
 }
 
-/*————————————————————————————
- * 轮询定时器回调
- *————————————————————————————*/
+/* ============================================================
+ * button_task - 处理按钮事件（在独立任务中执行，非 esp_timer）
+ *
+ * 职责：消费事件队列，发布到 event_bus
+ * 栈大小：8192 bytes（足够支持 ESP_LOGI + state 操作）
+ * ============================================================ */
+static void button_task_entry(void *arg)
+{
+    (void)arg;
+    btn_evt_t evt;
+
+    ESP_LOGI(TAG, "Button task started");
+
+    while (1) {
+        /* 等待事件队列（阻塞模式）*/
+        if (xQueueReceive(s_evt_queue, &evt, portMAX_DELAY) == pdTRUE) {
+            switch (evt.type) {
+            case BTN_EVT_PRESSED:
+                publish_event(EVENT_BUTTON_PRESSED, evt.gpio);
+                push_event(BUTTON_EVENT_PRESS);
+                break;
+
+            case BTN_EVT_RELEASED:
+                publish_event(EVENT_BUTTON_RELEASED, evt.gpio);
+                push_event(BUTTON_EVENT_RELEASE);
+                break;
+
+            case BTN_EVT_CLICKED:
+                publish_event(EVENT_BUTTON_CLICKED, evt.gpio);
+                push_event(BUTTON_EVENT_PRESS);  /* CLICK = 内部事件 */
+                break;
+
+            case BTN_EVT_DOUBLE_CLICKED:
+                publish_event(EVENT_BUTTON_DOUBLE_CLICKED, evt.gpio);
+                push_event(BUTTON_EVENT_DOUBLE_CLICK);
+                break;
+
+            case BTN_EVT_LONG_PRESSED:
+                publish_event(EVENT_BUTTON_LONG_PRESSED, evt.gpio);
+                push_event(BUTTON_EVENT_LONG_PRESS);
+                break;
+
+            case BTN_EVT_HOLD:
+                publish_event(EVENT_BUTTON_HOLD, evt.gpio);
+                break;
+
+            default:
+                break;
+            }
+        }
+    }
+}
+
+/* ============================================================
+ * polling_callback - 轮询定时器回调（esp_timer task context）
+ *
+ * 规则：esp_timer callback 必须极轻量！
+ * 本函数只做：
+ *   1. GPIO 读取
+ *   2. 状态机更新
+ *   3. 事件发送到 button_task 队列
+ * 禁止：ESP_LOG、publish_event、任何业务逻辑
+ * ============================================================ */
 static void polling_callback(void *arg)
 {
     (void)arg;
@@ -100,22 +216,21 @@ static void polling_callback(void *arg)
 
         switch (btn->state) {
         case BTN_STATE_IDLE:
-            if (level == 0) {  // 低电平按下
-                btn->state       = BTN_STATE_DEBOUNCE;
-                btn->press_start_ms = now_ms;
-                btn->last_long_ms  = 0;
+            if (level == 0) {  /* 低电平按下 */
+                btn->state           = BTN_STATE_DEBOUNCE;
+                btn->press_start_ms   = now_ms;
+                btn->last_long_ms     = 0;
             }
             break;
 
         case BTN_STATE_DEBOUNCE:
             if (level == 0 && (now_ms - btn->press_start_ms) >= DEBOUNCE_TIME_MS) {
                 /* 消抖通过，按下生效 */
-                btn->state        = BTN_STATE_PRESSED;
-                btn->press_start_ms = now_ms;
+                btn->state            = BTN_STATE_PRESSED;
+                btn->press_start_ms   = now_ms;
 
-                ESP_LOGI(TAG, "GPIO%d: PRESS", btn->gpio);
-                publish_event(EVENT_BUTTON_PRESSED, btn->gpio);
-                push_event(BUTTON_EVENT_PRESS);
+                /* 只发送到队列，不做任何业务处理 */
+                send_evt_to_task(BTN_EVT_PRESSED, btn->gpio);
 
             } else if (level == 1) {
                 /* 消抖期间松开，忽略 */
@@ -133,9 +248,7 @@ static void polling_callback(void *arg)
 
                 /* 检查双击 */
                 if (s_waiting_double && (now_ms - s_last_click_ms) < DOUBLE_CLICK_TIME_MS) {
-                    ESP_LOGI(TAG, "GPIO%d: DOUBLE_CLICK", btn->gpio);
-                    publish_event(EVENT_BUTTON_DOUBLE_CLICKED, btn->gpio);
-                    push_event(BUTTON_EVENT_DOUBLE_CLICK);
+                    send_evt_to_task(BTN_EVT_DOUBLE_CLICKED, btn->gpio);
                     s_waiting_double = false;
                 } else {
                     /* 300ms 后若无双击，发送 CLICK */
@@ -143,22 +256,17 @@ static void polling_callback(void *arg)
                     s_last_click_ms = now_ms;
                 }
 
-                ESP_LOGI(TAG, "GPIO%d: RELEASE", btn->gpio);
-                publish_event(EVENT_BUTTON_RELEASED, btn->gpio);
-                push_event(BUTTON_EVENT_RELEASE);
+                send_evt_to_task(BTN_EVT_RELEASED, btn->gpio);
 
             } else if (long_reached) {
                 /* 到达长按阈值：LONG_PRESS + 进入 HOLD 状态 */
                 btn->state       = BTN_STATE_LONG;
                 btn->last_long_ms = now_ms;
 
-                ESP_LOGI(TAG, "GPIO%d: LONG_PRESS", btn->gpio);
-                publish_event(EVENT_BUTTON_LONG_PRESSED, btn->gpio);
-                push_event(BUTTON_EVENT_LONG_PRESS);
+                send_evt_to_task(BTN_EVT_LONG_PRESSED, btn->gpio);
 
                 /* 立即发送第一个 HOLD */
-                ESP_LOGD(TAG, "GPIO%d: HOLD", btn->gpio);
-                publish_event(EVENT_BUTTON_HOLD, btn->gpio);
+                send_evt_to_task(BTN_EVT_HOLD, btn->gpio);
             }
             break;
         }
@@ -169,16 +277,13 @@ static void polling_callback(void *arg)
             if (released) {
                 /* 释放 */
                 btn->state = BTN_STATE_IDLE;
-                ESP_LOGI(TAG, "GPIO%d: RELEASE (after hold)", btn->gpio);
-                publish_event(EVENT_BUTTON_RELEASED, btn->gpio);
-                push_event(BUTTON_EVENT_RELEASE);
+                send_evt_to_task(BTN_EVT_RELEASED, btn->gpio);
 
             } else {
                 /* 持续按住：每 HOLD_INTERVAL_MS 发送一次 HOLD */
                 if (now_ms - btn->last_long_ms >= HOLD_INTERVAL_MS) {
                     btn->last_long_ms = now_ms;
-                    ESP_LOGD(TAG, "GPIO%d: HOLD", btn->gpio);
-                    publish_event(EVENT_BUTTON_HOLD, btn->gpio);
+                    send_evt_to_task(BTN_EVT_HOLD, btn->gpio);
                 }
             }
             break;
@@ -189,15 +294,13 @@ static void polling_callback(void *arg)
     /* 处理双击超时：300ms 内无第二次按下，发送 CLICK */
     if (s_waiting_double && (now_ms - s_last_click_ms) >= DOUBLE_CLICK_TIME_MS) {
         s_waiting_double = false;
-        ESP_LOGI(TAG, "CLICK (single)");
-        publish_event(EVENT_BUTTON_CLICKED, s_buttons[0].gpio);  /* 单按键场景 */
-        push_event(BUTTON_EVENT_PRESS);  /* CLICK */
+        send_evt_to_task(BTN_EVT_CLICKED, s_buttons[0].gpio);  /* 单按键场景 */
     }
 }
 
-/*————————————————————————————
+/*----------------------------
  * button_init
- *————————————————————————————*/
+ *----------------------------*/
 esp_err_t button_init(gpio_num_t gpio_num)
 {
     if (s_button_count >= MAX_BUTTONS) {
@@ -223,8 +326,32 @@ esp_err_t button_init(gpio_num_t gpio_num)
     btn->last_level = gpio_get_level(gpio_num);
     s_button_count++;
 
-    /* 仅第一个按键创建定时器 */
+    /* 仅第一个按键初始化任务和定时器 */
     if (s_button_count == 1) {
+        /* 1. 创建事件队列 */
+        s_evt_queue = xQueueCreate(BTN_EVT_QUEUE_SIZE, sizeof(btn_evt_t));
+        if (s_evt_queue == NULL) {
+            ESP_LOGE(TAG, "Failed to create button event queue");
+            return ESP_FAIL;
+        }
+
+        /* 2. 创建 button_task（栈 8192 bytes，支持 ESP_LOGI + state 操作）*/
+        BaseType_t created = xTaskCreate(
+            &button_task_entry,
+            "button",
+            8192,   /* 栈大小 */
+            NULL,   /* 参数 */
+            3,      /* 优先级 */
+            &s_btn_task
+        );
+        if (created != pdTRUE) {
+            ESP_LOGE(TAG, "Failed to create button task");
+            vQueueDelete(s_evt_queue);
+            s_evt_queue = NULL;
+            return ESP_FAIL;
+        }
+
+        /* 3. 创建轮询定时器 */
         const esp_timer_create_args_t timer_args = {
             .callback      = &polling_callback,
             .arg           = NULL,
@@ -232,7 +359,7 @@ esp_err_t button_init(gpio_num_t gpio_num)
             .dispatch_method = ESP_TIMER_TASK,
         };
         ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_polling_timer));
-        ESP_ERROR_CHECK(esp_timer_start_periodic(s_polling_timer, 20 * 1000));  // 20ms
+        ESP_ERROR_CHECK(esp_timer_start_periodic(s_polling_timer, 20 * 1000));  /* 20ms */
         ESP_LOGI(TAG, "Button polling timer started (20ms)");
     }
 
@@ -240,25 +367,26 @@ esp_err_t button_init(gpio_num_t gpio_num)
     return ESP_OK;
 }
 
-/*————————————————————————————
+/*----------------------------
  * button_get_event
- *————————————————————————————*/
+ *----------------------------*/
 button_event_t button_get_event(void)
 {
     if (s_evt_tail == s_evt_head) {
         return (button_event_t)-1;
     }
-    int next = (s_evt_tail + 1) % EVT_QUEUE_SIZE;
-    button_event_t ev = s_evt_queue[s_evt_tail];
+    int next = (s_evt_tail + 1) % BTN_LEGACY_EVT_QUEUE_SIZE;
+    button_event_t ev = s_legacy_evt_queue[s_evt_tail];
     s_evt_tail = next;
     return ev;
 }
 
-/*————————————————————————————
+/*----------------------------
  * button_set_long_press_time
- *————————————————————————————*/
+ *----------------------------*/
 void button_set_long_press_time(uint32_t long_press_ms)
 {
     s_long_press_ms = long_press_ms;
-    ESP_LOGI(TAG, "Long press threshold: %lu ms", long_press_ms);
+    /* 此函数在 app_main 初始化时调用，ESP_LOGI 无栈溢出风险 */
+    ESP_LOGI(TAG, "Long press threshold: %lu ms", (unsigned long)long_press_ms);
 }

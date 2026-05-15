@@ -1,9 +1,11 @@
 /**
  * @file led.c
- * @brief LED 组件 - WS2812B RGB LED 驱动实现（Pattern 版）
+ * @brief LED 组件 - WS2812B RGB LED 驱动实现（Task 分离版）
  *
- * 基于 ESP-IDF RMT TX + led_strip_encoder
- * Pattern 由内部 esp_timer 驱动，50ms 更新间隔。
+ * 架构原则：
+ * - esp_timer callback (led_tick_callback) 只发送通知
+ * - LED 更新逻辑在 led_task 中执行
+ * - 使用 math.h sin() 计算 breathing，需要足够栈空间
  */
 
 #include "led.h"
@@ -24,6 +26,9 @@ static const char *TAG = "led";
 /* Pattern 更新周期（ms）*/
 #define LED_TICK_MS         50
 
+/* 任务栈大小（需要足够 math.h sin() 调用）*/
+#define LED_TASK_STACK      4096
+
 /* 静态变量 */
 static rmt_channel_handle_t      s_rmt_chan      = NULL;
 static rmt_encoder_handle_t      s_led_encoder   = NULL;
@@ -41,6 +46,35 @@ static uint8_t                   s_pixel_buf[LED_PIXEL_BUF_SIZE];
 
 /* 内部时间戳（ms），用于计算 breathing/blink 相位 */
 static uint64_t                  s_tick_count     = 0;
+
+/* 任务和通知 */
+static TaskHandle_t              s_led_task       = NULL;
+static SemaphoreHandle_t         s_update_sem     = NULL;
+
+/* Forward declarations */
+static void led_tick_callback(void *arg);
+static void led_update(void);
+
+/*————————————————————————————
+ * led_task — LED 更新任务（在独立任务中执行）
+ *
+ * 职责：每 50ms 执行一次 led_update()
+ * led_update() 包含 math.h sin() 计算，需要足够栈
+ *————————————————————————————*/
+static void led_task_entry(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "LED task started");
+
+    while (1) {
+        /* 等待更新信号（来自 led_tick_callback）*/
+        if (xSemaphoreTake(s_update_sem, portMAX_DELAY) == pdTRUE) {
+            /* 执行 LED 更新（breathing 计算 + RMT 发送）*/
+            /* 此函数包含 sin() 调用，不能在 esp_timer 5KB 栈执行 */
+            led_update();
+        }
+    }
+}
 
 /*————————————————————————————
  * 内部：硬件发送一次像素
@@ -83,11 +117,11 @@ static void led_update(void)
             break;
 
         case LED_PATTERN_BREATHING: {
-            uint16_t period_ms  = s_pattern.param1 > 0 ? s_pattern.param1 : 2000; // 默认 2s 周期
-            uint16_t min_pct   = s_pattern.param2 > 0 ? s_pattern.param2 : 20;     // 默认最低 20%
+            uint16_t period_ms  = s_pattern.param1 > 0 ? s_pattern.param1 : 2000; /* 默认 2s 周期 */
+            uint16_t min_pct   = s_pattern.param2 > 0 ? s_pattern.param2 : 20;  /* 默认最低 20% */
             uint64_t total_ticks = period_ms / LED_TICK_MS;
             float   phase = (s_tick_count % total_ticks) * (2.0f * M_PI / total_ticks);
-            // sin ∈ [-1, 1] → [0, 1]
+            /* sin ∈ [-1, 1] → [0, 1] */
             float sin_val = ( sinf((float)phase) + 1.0f ) / 2.0f;
             float min_bright = min_pct / 100.0f;
             brightness = min_bright + sin_val * (1.0f - min_bright);
@@ -98,9 +132,9 @@ static void led_update(void)
         }
 
         case LED_PATTERN_BLINK: {
-            uint16_t freq_hz   = s_pattern.param1 > 0 ? s_pattern.param1 : 2;  // 默认 2Hz
-            uint16_t duty_pct  = s_pattern.param2 > 0 ? s_pattern.param2 : 50; // 默认 50% 占空比
-            uint64_t cycle_ticks = 1000 / LED_TICK_MS / freq_hz;                // 一周期 tick 数
+            uint16_t freq_hz   = s_pattern.param1 > 0 ? s_pattern.param1 : 2;   /* 默认 2Hz */
+            uint16_t duty_pct  = s_pattern.param2 > 0 ? s_pattern.param2 : 50; /* 默认 50% 占空比 */
+            uint64_t cycle_ticks = 1000 / LED_TICK_MS / freq_hz;                /* 一周期 tick 数 */
             uint64_t on_ticks   = cycle_ticks * duty_pct / 100;
             bool on = (s_tick_count % cycle_ticks) < on_ticks;
             if (on) {
@@ -129,12 +163,21 @@ static void led_update(void)
 }
 
 /*————————————————————————————
- * 定时器回调（静态，不能传参数）
+ * led_tick_callback — 定时器回调（esp_timer task context）
+ *
+ * 规则：esp_timer callback 必须极轻量！
+ * 本函数只做：发送信号量给 led_task
+ * 禁止：math.h、rmt_transmit、led_refresh
  *————————————————————————————*/
 static void led_tick_callback(void *arg)
 {
     (void)arg;
-    led_update();
+    /* 发送信号量，led_task 会在自己的栈（4096 bytes）中执行 led_update() */
+    BaseType_t higher_wake = pdFALSE;
+    xSemaphoreGiveFromISR(s_update_sem, &higher_wake);
+    if (higher_wake == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
 }
 
 /*————————————————————————————
@@ -149,7 +192,30 @@ esp_err_t led_init(gpio_num_t gpio_num)
 
     ESP_LOGI(TAG, "Initializing WS2812B on GPIO%d", gpio_num);
 
-    /* 1. RMT TX 通道 */
+    /* 1. 创建信号量 */
+    s_update_sem = xSemaphoreCreateBinary();
+    if (s_update_sem == NULL) {
+        ESP_LOGE(TAG, "Failed to create LED semaphore");
+        return ESP_FAIL;
+    }
+
+    /* 2. 创建 LED 任务（栈 4096 bytes，支持 sin() 计算）*/
+    BaseType_t created = xTaskCreate(
+        &led_task_entry,
+        "led",
+        LED_TASK_STACK,
+        NULL,
+        2,      /* 优先级 */
+        &s_led_task
+    );
+    if (created != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to create LED task");
+        vSemaphoreDelete(s_update_sem);
+        s_update_sem = NULL;
+        return ESP_FAIL;
+    }
+
+    /* 3. RMT TX 通道 */
     rmt_tx_channel_config_t tx_chan_cfg = {
         .clk_src           = RMT_CLK_SRC_DEFAULT,
         .gpio_num          = gpio_num,
@@ -159,28 +225,28 @@ esp_err_t led_init(gpio_num_t gpio_num)
     };
     ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_cfg, &s_rmt_chan));
 
-    /* 2. led_strip_encoder */
+    /* 4. led_strip_encoder */
     led_strip_encoder_config_t enc_cfg = {
         .resolution = 10 * 1000 * 1000,
     };
     ESP_ERROR_CHECK(rmt_new_led_strip_encoder(&enc_cfg, &s_led_encoder));
 
-    /* 3. 使能 RMT */
+    /* 5. 使能 RMT */
     ESP_ERROR_CHECK(rmt_enable(s_rmt_chan));
 
-    /* 4. 创建更新定时器 */
+    /* 6. 创建更新定时器 */
     const esp_timer_create_args_t timer_args = {
         .callback = &led_tick_callback,
         .name     = "led_tick",
     };
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_tick_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(s_tick_timer, LED_TICK_MS * 1000));  // 微秒
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_tick_timer, LED_TICK_MS * 1000));  /* 微秒 */
 
     s_initialized   = true;
     s_pattern_active = false;
     s_tick_count    = 0;
 
-    /* 5. 默认熄灭 */
+    /* 7. 默认熄灭 */
     led_off();
 
     ESP_LOGI(TAG, "LED initialized OK (GPIO%d, tick=%dms)", gpio_num, LED_TICK_MS);
