@@ -30,6 +30,12 @@ static bool s_connected = false;
 static bool s_reconnect_enabled = true;
 static TaskHandle_t s_reconnect_task = NULL;
 
+// WiFi 状态回调（最多 2 个）
+#define WIFI_CB_MAX 2
+static wifi_status_callback_t s_callbacks[WIFI_CB_MAX];
+static void *s_callback_args[WIFI_CB_MAX];
+static int s_callback_count = 0;
+
 // WiFi 配置
 static wifi_config_t s_wifi_config = {0};
 
@@ -51,10 +57,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "Scheduling reconnect in 1 second...");
             xTaskNotifyGive(s_reconnect_task);
         }
+        /* 通知所有回调（WiFi 断开）*/
+        for (int i = 0; i < s_callback_count; i++) {
+            if (s_callbacks[i]) {
+                s_callbacks[i](false, s_callback_args[i]);
+            }
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_connected = true;
+        /* 通知所有回调（WiFi 连接）*/
+        for (int i = 0; i < s_callback_count; i++) {
+            if (s_callbacks[i]) {
+                s_callbacks[i](true, s_callback_args[i]);
+            }
+        }
     }
 }
 
@@ -208,4 +226,23 @@ void wifi_manager_disconnect(void)
 bool wifi_manager_is_connected(void)
 {
     return s_connected;
+}
+
+/*======================================================================
+ * WiFi 状态回调
+ *======================================================================*/
+esp_err_t wifi_manager_register_callback(wifi_status_callback_t callback, void *user_data)
+{
+    if (callback == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_callback_count >= WIFI_CB_MAX) {
+        ESP_LOGE(TAG, "Too many WiFi callbacks (max=%d)", WIFI_CB_MAX);
+        return ESP_ERR_NO_MEM;
+    }
+    s_callbacks[s_callback_count] = callback;
+    s_callback_args[s_callback_count] = user_data;
+    s_callback_count++;
+    ESP_LOGI(TAG, "WiFi callback registered (total=%d)", s_callback_count);
+    return ESP_OK;
 }

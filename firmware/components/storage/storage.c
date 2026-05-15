@@ -637,6 +637,65 @@ esp_err_t storage_delete_file(const char *file_path)
 }
 
 /*======================================================================
+ * storage_delete_file_vfs - 删除任意相对路径文件
+ *======================================================================*/
+esp_err_t storage_delete_file_vfs(const char *relative_path)
+{
+    if (!s_mounted || relative_path == NULL || relative_path[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char vfs_path[MAX_FILE_PATH];
+    snprintf(vfs_path, sizeof(vfs_path), "%s/%s", MOUNT_POINT, relative_path);
+
+    if (unlink(vfs_path) != 0) {
+        ESP_LOGE(TAG, "[DELETE] failed: %s (errno=%d)", vfs_path, errno);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "[DELETE] %s", vfs_path);
+    return ESP_OK;
+}
+
+/*======================================================================
+ * storage_rename_file - 跨目录重命名/移动文件
+ *======================================================================*/
+esp_err_t storage_rename_file(storage_path_type_t src_type, const char *src_filename,
+                               storage_path_type_t dst_type, const char *dst_filename)
+{
+    if (!s_mounted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!IS_VALID_PATH_TYPE(src_type) || !IS_VALID_PATH_TYPE(dst_type)) {
+        ESP_LOGE(TAG, "rename: invalid path type (src=%d dst=%d)", src_type, dst_type);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (src_filename == NULL || dst_filename == NULL ||
+        src_filename[0] == '\0' || dst_filename[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char src_path[MAX_FILE_PATH];
+    char dst_path[MAX_FILE_PATH];
+
+    esp_err_t err = storage_build_vfs_path(src_path, sizeof(src_path), src_type, src_filename);
+    if (err != ESP_OK) return err;
+    err = storage_build_vfs_path(dst_path, sizeof(dst_path), dst_type, dst_filename);
+    if (err != ESP_OK) return err;
+
+    ESP_LOGI(TAG, "[RENAME] %s -> %s", src_path, dst_path);
+
+    int ret = rename(src_path, dst_path);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "[RENAME] failed errno=%d (%s)", errno, strerror(errno));
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "[RENAME] success");
+    return ESP_OK;
+}
+
+/*======================================================================
  * storage_file_exists - 检查文件是否存在（POSIX stat）
  *======================================================================*/
 bool storage_file_exists(const char *file_path)

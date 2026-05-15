@@ -35,6 +35,15 @@ typedef struct {
 esp_err_t uploader_init(const uploader_config_t *config);
 
 /**
+ * @brief 启动独立上传队列任务
+ *
+ * 该任务独立运行，不阻塞 recorder。
+ * 启动时扫描 upload_queue/ 目录恢复未上传文件。
+ * @return esp_err_t
+ */
+esp_err_t uploader_start(void);
+
+/**
  * @brief 上传 WAV 文件
  * @param file_path WAV 文件路径（TF 卡上）
  * @param[out] out_response 服务端响应缓冲区（可选填 NULL）

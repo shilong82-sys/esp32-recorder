@@ -45,4 +45,21 @@ void wifi_manager_disconnect(void);
  */
 bool wifi_manager_is_connected(void);
 
+/**
+ * @brief WiFi 连接状态回调类型
+ * @param connected true=连接成功，false=断开
+ * @param user_data 注册时传入的用户数据
+ */
+typedef void (*wifi_status_callback_t)(bool connected, void *user_data);
+
+/**
+ * @brief 注册 WiFi 状态变化回调
+ * @param callback 回调函数（不可为 NULL）
+ * @param user_data 传给回调的用户数据
+ * @return ESP_OK=注册成功
+ *
+ * 限制：最多注册 2 个回调（uploader + 其他模块）
+ */
+esp_err_t wifi_manager_register_callback(wifi_status_callback_t callback, void *user_data);
+
 #endif // WIFI_MANAGER_H

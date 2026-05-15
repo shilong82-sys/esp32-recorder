@@ -91,6 +91,27 @@ int storage_list_wav_files(const char *dir_path, char file_list[][64], int max_f
 esp_err_t storage_delete_file(const char *file_path);
 
 /**
+ * @brief 重命名/移动文件（跨目录）
+ * @param src_type 源目录类型（STORAGE_PATH_RECORDINGS 等）
+ * @param src_filename 源文件名
+ * @param dst_type 目标目录类型
+ * @param dst_filename 目标文件名
+ * @return esp_err_t
+ *
+ * 注意：FATFS rename() 要求源和目标在同一卷，ESP-IDF VFS 保证 /sdcard 下同一卷。
+ */
+esp_err_t storage_rename_file(storage_path_type_t src_type, const char *src_filename,
+                               storage_path_type_t dst_type, const char *dst_filename);
+
+/**
+ * @brief 删除文件（支持任意相对路径）
+ * @param relative_path 相对于 /sdcard 的路径，如 "recordings/test.wav"
+ *                            或 "upload_queue/test.wav"
+ * @return esp_err_t
+ */
+esp_err_t storage_delete_file_vfs(const char *relative_path);
+
+/**
  * @brief 检查文件是否存在
  * @param file_path 文件路径
  * @return true=存在, false=不存在

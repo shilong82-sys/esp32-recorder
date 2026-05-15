@@ -40,6 +40,7 @@
 #include "uploader.h"
 #include "logger.h"
 #include "audio.h"
+#include "esp_adc/adc_oneshot.h"
 
 /* 测试硬件引脚定义 */
 #ifndef GPIO_LED
@@ -202,23 +203,23 @@ void app_main(void)
              (unsigned long)esp_get_free_heap_size());
 
     /* 3. Event Bus（最先，所有模块依赖）*/
-    ESP_LOGI(TAG, "[1/11] Event Bus ...");
+    ESP_LOGI(TAG, "[1/12] Event Bus ...");
     event_bus_init();
 
     /* 4. State 状态机 */
-    ESP_LOGI(TAG, "[2/11] State ...");
+    ESP_LOGI(TAG, "[2/12] State ...");
     ret = state_init();
     ESP_ERROR_CHECK(ret);
 
     /* 5. LED 硬件初始化 */
-    ESP_LOGI(TAG, "[3/11] LED (GPIO%d) ...", GPIO_LED);
+    ESP_LOGI(TAG, "[3/12] LED (GPIO%d) ...", GPIO_LED);
     ret = led_init(GPIO_LED);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "LED init failed (0x%x)", ret);
     }
 
     /* 6. Button 硬件初始化 */
-    ESP_LOGI(TAG, "[4/11] Button (GPIO%d) ...", GPIO_BUTTON);
+    ESP_LOGI(TAG, "[4/12] Button (GPIO%d) ...", GPIO_BUTTON);
     button_set_long_press_time(1500);
     ret = button_init(GPIO_BUTTON);
     if (ret != ESP_OK) {
@@ -226,16 +227,16 @@ void app_main(void)
     }
 
     /* 7. UI 组件（订阅事件，启动 UI task）*/
-    ESP_LOGI(TAG, "[5/11] UI ...");
+    ESP_LOGI(TAG, "[5/12] UI ...");
     ret = ui_init();
     ESP_ERROR_CHECK(ret);
 
-    /* 8. System Monitor（栈/堆监控）*/
-    ESP_LOGI(TAG, "[6/11] System Monitor ...");
+    /* 6. System Monitor（栈/堆监控）*/
+    ESP_LOGI(TAG, "[6/12] System Monitor ...");
     system_monitor_init(10000);  /* 每 10s 打印一次所有任务栈水位线 */
 
     /* 7. Audio（I2S 麦克风采集验证任务，永远运行，sole I2S owner）*/
-    ESP_LOGI(TAG, "[7/11] Audio (INMP441 I2S Mic) ...");
+    ESP_LOGI(TAG, "[7/12] Audio (INMP441 I2S Mic) ...");
     BaseType_t audio_task_created = xTaskCreatePinnedToCore(
         &audio_task,
         "audio",
@@ -250,7 +251,7 @@ void app_main(void)
     }
 
     /* 8. Storage TF 卡（使用默认挂载点 /sdcard） */
-    ESP_LOGI(TAG, "[8/11] Storage (SPI mode) ...");
+    ESP_LOGI(TAG, "[8/12] Storage (SPI mode) ...");
     ret = storage_mount(NULL);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Storage mount OK, testing read/write...");
@@ -268,7 +269,7 @@ void app_main(void)
     }
 
     /* 9. WiFi */
-    ESP_LOGI(TAG, "[9/11] WiFi ...");
+    ESP_LOGI(TAG, "[9/12] WiFi ...");
     wifi_manager_init();
     ret = wifi_manager_restore_connection();
     if (ret == ESP_OK) {
@@ -278,7 +279,7 @@ void app_main(void)
     }
 
     /* 10. Recorder */
-    ESP_LOGI(TAG, "[10/11] Recorder ...");
+    ESP_LOGI(TAG, "[10/12] Recorder ...");
     recorder_config_t rec_cfg = {
         .i2s_port        = I2S_NUM_0,
         .sample_rate     = 16000,
@@ -290,7 +291,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     /* 11. Battery */
-    ESP_LOGI(TAG, "[11/11] Battery ...");
+    ESP_LOGI(TAG, "[11/12] Battery ...");
     battery_config_t bat_cfg = {
         .adc_channel     = ADC_CHANNEL_0,
         .adc_atten       = ADC_ATTEN_DB_12,
@@ -302,8 +303,8 @@ void app_main(void)
     int pct = battery_get_percentage();
     ESP_LOGI(TAG, "Battery: %d%%", pct);
 
-    /* 11. Uploader */
-    ESP_LOGI(TAG, "[11/11] Uploader ...");
+    /* 12. Uploader (独立任务，队列模式) */
+    ESP_LOGI(TAG, "[12/12] Uploader (queue mode) ...");
     uploader_config_t up_cfg = {
         .server_ip   = "192.168.31.185",
         .server_port = 8000,
@@ -311,6 +312,10 @@ void app_main(void)
         .timeout_ms  = 30000,
     };
     uploader_init(&up_cfg);
+    ret = uploader_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "uploader_start failed: %s", esp_err_to_name(ret));
+    }
 
     /* 订阅事件（业务处理层）*/
     event_bus_subscribe(EVENT_BUTTON_PRESSED,       on_button_event, NULL);

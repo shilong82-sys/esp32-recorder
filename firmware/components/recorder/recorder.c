@@ -453,6 +453,25 @@ esp_err_t recorder_stop(uint32_t *out_duration_ms)
         s_rec.file = NULL;
     }
 
+    /*
+     * Step: Move to upload_queue
+     * Only after fclose() confirms file is finalized on disk.
+     * Rename failure → log error but do NOT crash; file stays in recordings/.
+     * The uploader startup scan covers both upload_queue/ and recordings/.
+     */
+    const char *filename = strrchr(s_rec.filepath, '/');
+    filename = filename ? filename + 1 : s_rec.filepath;
+    esp_err_t rename_err = storage_rename_file(
+        STORAGE_PATH_RECORDINGS, filename,
+        STORAGE_PATH_UPLOAD_QUEUE, filename);
+    if (rename_err != ESP_OK) {
+        ESP_LOGE(TAG, "[QUEUE] rename to upload_queue FAILED (%s) — file stays in recordings/",
+                 esp_err_to_name(rename_err));
+        ESP_LOGE(TAG, "[QUEUE] filename: %s", filename);
+    } else {
+        ESP_LOGI(TAG, "[QUEUE] -> upload_queue/%s", filename);
+    }
+
     /* Calculate duration */
     int64_t now_us = esp_timer_get_time();
     uint32_t duration_ms = (uint32_t)((now_us - s_rec.recording_start_us) / 1000);
