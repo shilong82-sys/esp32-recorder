@@ -22,6 +22,7 @@
 #include "esp_http_client.h"
 #include <string.h>
 #include <sys/unistd.h>
+#include <sys/stat.h>
 #include <dirent.h>
 
 static const char *TAG = "uploader";
@@ -64,6 +65,54 @@ static uploader_config_t s_config = {
 /*======================================================================
  * Internal Helpers
  *======================================================================*/
+
+/**
+ * Check if a file exists in a given storage path directory.
+ */
+static bool file_exists_in_dir(storage_path_type_t type, const char *filename)
+{
+    char vfs_path[128];
+    if (storage_build_vfs_path(vfs_path, sizeof(vfs_path), type, filename) != ESP_OK) {
+        return false;
+    }
+    struct stat st;
+    return (stat(vfs_path, &st) == 0 && S_ISREG(st.st_mode));
+}
+
+/**
+ * Generate a safe archive filename for uploaded/ directory.
+ *
+ * If filename already exists in uploaded/ (e.g., from previous upload cycle),
+ * auto-generate REC_SESSION_xxxx_1.wav, _2.wav, etc.
+ */
+static void safe_archive_name(const char *src_filename, char *out_safe, size_t out_size)
+{
+    if (out_size < 64) return;
+
+    if (!file_exists_in_dir(STORAGE_PATH_UPLOADED, src_filename)) {
+        snprintf(out_safe, out_size, "%s", src_filename);
+        return;
+    }
+
+    /* Extract base id and try _1, _2, ... */
+    unsigned int base_id = 0;
+    if (sscanf(src_filename, "REC_SESSION_%4u.wav", &base_id) == 1) {
+        for (unsigned int suffix = 1; suffix <= 999; suffix++) {
+            char candidate[64];
+            snprintf(candidate, sizeof(candidate),
+                     "REC_SESSION_%04u_%u.wav", base_id, suffix);
+            if (!file_exists_in_dir(STORAGE_PATH_UPLOADED, candidate)) {
+                LOG_ARCHIVE("collision: %s -> %s", src_filename, candidate);
+                snprintf(out_safe, out_size, "%s", candidate);
+                return;
+            }
+        }
+    }
+
+    /* Fallback: append _archive */
+    snprintf(out_safe, out_size, "%.*s_archive.wav",
+             (int)(strlen(src_filename) - 4), src_filename);
+}
 
 /**
  * 获取 upload_queue/ 中第一个 WAV 文件（按字母序 = FIFO）
@@ -324,17 +373,22 @@ static void uploader_task(void *arg)
 
         /* 5. 处理结果 */
         if (upload_err == ESP_OK) {
-            /* 归档：rename upload_queue/ -> uploaded/ */
+            /* 归档：rename upload_queue/ -> uploaded/ (安全命名，防止冲突) */
+            char safe_name[64];
+            safe_archive_name(filename, safe_name, sizeof(safe_name));
+
+            ESP_LOGI(TAG, "[ARCHIVE] %s -> uploaded/%s", filename, safe_name);
+
             esp_err_t arch_err = storage_rename_file(
                 STORAGE_PATH_UPLOAD_QUEUE, filename,
-                STORAGE_PATH_UPLOADED, filename);
+                STORAGE_PATH_UPLOADED, safe_name);
 
             if (arch_err != ESP_OK) {
                 /* 归档失败不应该删除，保留原文件 */
                 ESP_LOGE(TAG, "[ARCHIVE] rename failed: %s — file kept in upload_queue/",
                          filename);
             } else {
-                LOG_ARCHIVE("uploaded/%s", filename);
+                LOG_ARCHIVE("uploaded/%s", safe_name);
             }
         } else {
             /* 全部重试失败：保留文件，等待下一轮扫描 */
