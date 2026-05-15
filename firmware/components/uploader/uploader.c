@@ -20,7 +20,10 @@
 #include "wifi_manager.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
+#include "esp_random.h"
+#include <errno.h>
 #include <string.h>
+#include <time.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -83,7 +86,7 @@ static bool file_exists_in_dir(storage_path_type_t type, const char *filename)
  * Generate a safe archive filename for uploaded/ directory.
  *
  * If filename already exists in uploaded/ (e.g., from previous upload cycle),
- * auto-generate REC_SESSION_xxxx_1.wav, _2.wav, etc.
+ * append Unix timestamp: REC_SESSION_xxxx_1712345678.wav
  */
 static void safe_archive_name(const char *src_filename, char *out_safe, size_t out_size)
 {
@@ -94,24 +97,39 @@ static void safe_archive_name(const char *src_filename, char *out_safe, size_t o
         return;
     }
 
-    /* Extract base id and try _1, _2, ... */
-    unsigned int base_id = 0;
-    if (sscanf(src_filename, "REC_SESSION_%4u.wav", &base_id) == 1) {
-        for (unsigned int suffix = 1; suffix <= 999; suffix++) {
-            char candidate[64];
-            snprintf(candidate, sizeof(candidate),
-                     "REC_SESSION_%04u_%u.wav", base_id, suffix);
-            if (!file_exists_in_dir(STORAGE_PATH_UPLOADED, candidate)) {
-                LOG_ARCHIVE("collision: %s -> %s", src_filename, candidate);
-                snprintf(out_safe, out_size, "%s", candidate);
-                return;
+    /* Extract base id: "REC_SESSION_0013.wav" -> base = "REC_SESSION_0013" */
+    char base[64];
+    size_t name_len = strlen(src_filename);
+    if (name_len > 4 && name_len < sizeof(base)) {
+        memcpy(base, src_filename, name_len - 4);  /* strip ".wav" */
+        base[name_len - 4] = '\0';
+    } else {
+        snprintf(base, sizeof(base), "%.*s", (int)(name_len - 4), src_filename);
+    }
+
+        /* Try: REC_SESSION_xxxx_TS.wav with incrementing suffix if needed */
+        for (unsigned int ts_suffix = 0; ts_suffix <= 999; ts_suffix++) {
+            time_t now = time(NULL);
+            uint32_t ts = (uint32_t)now;
+            char candidate[96];
+            if (ts_suffix == 0) {
+                snprintf(candidate, sizeof(candidate), "%s_%lu.wav", base, (unsigned long)ts);
+            } else {
+                snprintf(candidate, sizeof(candidate), "%s_%lu_%u.wav", base, (unsigned long)ts, ts_suffix);
             }
+
+        if (!file_exists_in_dir(STORAGE_PATH_UPLOADED, candidate)) {
+            LOG_ARCHIVE("collision: %s -> %s", src_filename, candidate);
+            snprintf(out_safe, out_size, "%s", candidate);
+            return;
         }
     }
 
-    /* Fallback: append _archive */
-    snprintf(out_safe, out_size, "%.*s_archive.wav",
-             (int)(strlen(src_filename) - 4), src_filename);
+    /* Fallback: use random suffix */
+    uint32_t rnd = esp_random();
+    char fallback[96];
+    snprintf(fallback, sizeof(fallback), "%s_r%08lx.wav", base, (unsigned long)rnd);
+    snprintf(out_safe, out_size, "%s", fallback);
 }
 
 /**
@@ -127,7 +145,7 @@ static bool get_next_file(char *buf, size_t buf_size)
 
     DIR *dir = opendir(queue_dir);
     if (dir == NULL) {
-        LOG_QUEUE("opendir failed: errno=%d", errno);
+        LOG_QUEUE("opendir failed: errno=%d (%s)", errno, strerror(errno));
         return false;
     }
 
@@ -189,12 +207,14 @@ static esp_err_t do_upload(const char *filename)
 
     struct stat st;
     if (stat(full_path, &st) != 0) {
-        ESP_LOGE(TAG, "[UPLOAD] file not found: %s", full_path);
+        ESP_LOGE(TAG, "[UPLOAD] file not found: %s errno=%d", full_path, errno);
         return ESP_FAIL;
     }
     uint32_t file_size = (uint32_t)st.st_size;
 
-    ESP_LOGI(TAG, "[UPLOAD] -> %s (%lu bytes)", filename, (unsigned long)file_size);
+    ESP_LOGI(TAG, "[UPLOAD] start");
+    ESP_LOGI(TAG, "[UPLOAD] filename=%s", filename);
+    ESP_LOGI(TAG, "[UPLOAD] size=%lu bytes", (unsigned long)file_size);
 
     /* 构建 URL */
     char url[256];
@@ -204,20 +224,21 @@ static esp_err_t do_upload(const char *filename)
     /* 打开文件 */
     FILE *fp = fopen(full_path, "rb");
     if (fp == NULL) {
-        ESP_LOGE(TAG, "[UPLOAD] fopen failed: %s", full_path);
+        ESP_LOGE(TAG, "[UPLOAD] fopen failed: %s errno=%d (%s)",
+                 full_path, errno, strerror(errno));
         return ESP_FAIL;
     }
 
     /* HTTP 客户端配置 */
     esp_http_client_config_t http_config = {
-        .url          = url,
+        .url           = url,
         .event_handler = http_event_handler,
         .timeout_ms    = s_config.timeout_ms,
         .method        = HTTP_METHOD_POST,
     };
     esp_http_client_handle_t client = esp_http_client_init(&http_config);
     if (client == NULL) {
-        ESP_LOGE(TAG, "[UPLOAD] esp_http_client_init failed");
+        ESP_LOGE(TAG, "[UPLOAD] esp_http_client_init failed: %p", client);
         fclose(fp);
         return ESP_FAIL;
     }
@@ -225,19 +246,21 @@ static esp_err_t do_upload(const char *filename)
     /* multipart/form-data */
     const char *boundary = "----ESP32Boundary123456789";
     char content_type[64];
-    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
+    snprintf(content_type, sizeof(content_type),
+             "multipart/form-data; boundary=%s", boundary);
     esp_http_client_set_header(client, "Content-Type", content_type);
 
     /* 开始请求 */
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "[UPLOAD] open failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "[UPLOAD] open failed: %s errno=%d",
+                 esp_err_to_name(err), errno);
         esp_http_client_cleanup(client);
         fclose(fp);
         return ESP_FAIL;
     }
 
-    /* 发送 multipart 头 */
+    /* 发送 multipart 头（RFC 2046 CRLF） */
     char header[512];
     int header_len = snprintf(header, sizeof(header),
         "--%s\r\n"
@@ -245,7 +268,13 @@ static esp_err_t do_upload(const char *filename)
         "Content-Type: audio/wav\r\n"
         "\r\n",
         boundary, filename);
-    esp_http_client_write(client, header, header_len);
+    int w = esp_http_client_write(client, header, header_len);
+    if (w < 0) {
+        ESP_LOGE(TAG, "[UPLOAD] header write failed: %s", esp_err_to_name(w));
+        esp_http_client_cleanup(client);
+        fclose(fp);
+        return ESP_FAIL;
+    }
 
     /* 发送文件内容 */
     uint8_t buf[CHUNK_SIZE];
@@ -254,12 +283,23 @@ static esp_err_t do_upload(const char *filename)
     while ((bytes_read = fread(buf, 1, CHUNK_SIZE, fp)) > 0) {
         int written = esp_http_client_write(client, (const char *)buf, bytes_read);
         if (written < 0) {
-            ESP_LOGE(TAG, "[UPLOAD] write error");
+            ESP_LOGE(TAG, "[UPLOAD] body write failed: %s errno=%d",
+                     esp_err_to_name(written), errno);
             esp_http_client_cleanup(client);
             fclose(fp);
             return ESP_FAIL;
         }
         total_sent += written;
+    }
+
+    int fread_err = ferror(fp);
+    if (fread_err != 0) {
+        ESP_LOGE(TAG, "[UPLOAD] fread error: errno=%d (%s)",
+                 fread_err, strerror(fread_err));
+        clearerr(fp);
+        fclose(fp);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
     }
     fclose(fp);
 
@@ -272,13 +312,13 @@ static esp_err_t do_upload(const char *filename)
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    ESP_LOGI(TAG, "[UPLOAD] HTTP %d", status);
+    ESP_LOGI(TAG, "[UPLOAD] http_code=%d", status);
 
     if (status >= 200 && status < 300) {
-        ESP_LOGI(TAG, "[UPLOAD] SUCCESS: %s", filename);
+        ESP_LOGI(TAG, "[UPLOAD] success: %s", filename);
         return ESP_OK;
     } else {
-        ESP_LOGE(TAG, "[UPLOAD] FAIL HTTP %d: %s", status, filename);
+        ESP_LOGE(TAG, "[UPLOAD] failed: %s http=%d", filename, status);
         return ESP_FAIL;
     }
 }
@@ -385,8 +425,8 @@ static void uploader_task(void *arg)
 
             if (arch_err != ESP_OK) {
                 /* 归档失败不应该删除，保留原文件 */
-                ESP_LOGE(TAG, "[ARCHIVE] rename failed: %s — file kept in upload_queue/",
-                         filename);
+                ESP_LOGE(TAG, "[ARCHIVE] rename failed: %s errno=%d (%s) — file kept in upload_queue/",
+                         filename, errno, strerror(errno));
             } else {
                 LOG_ARCHIVE("uploaded/%s", safe_name);
             }
