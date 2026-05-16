@@ -14,6 +14,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -101,18 +102,12 @@ static void reconnect_task(void *pvParameters)
 
 /**
  * @brief 初始化 WiFi Manager
+ * @note NVS 必须在此之前初始化（app_main 负责）。此函数不重复 init NVS。
  */
 esp_err_t wifi_manager_init(void)
 {
-    esp_err_t ret;
-
-    // 初始化 NVS
-    ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
+    // NVS 已在 app_main 通过 nvs_flash_init() 初始化，这里只检查状态
+    // 不重复调用 nvs_flash_init()，避免边界情况下覆盖已写入的 namespace
 
     // 初始化网络层
     ESP_ERROR_CHECK(esp_netif_init());
@@ -140,7 +135,51 @@ esp_err_t wifi_manager_init(void)
 }
 
 /**
+ * @brief 保存 WiFi 凭证到 NVS（不触发连接）
+ * @param ssid WiFi 名称
+ * @param passwd WiFi 密码（可为 NULL 表示开放网络）
+ * @return ESP_OK=保存成功，ESP_FAIL=NVS 保存失败（但固件仍可使用）
+ */
+esp_err_t wifi_save_credentials(const char *ssid, const char *passwd)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "[NVS] nvs_open failed: %s (0x%x)", esp_err_to_name(ret), ret);
+        return ESP_FAIL;
+    }
+
+    ret = nvs_set_str(nvs_handle, NVS_KEY_SSID, ssid);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "[NVS] nvs_set_str(ssid) failed: %s", esp_err_to_name(ret));
+        nvs_close(nvs_handle);
+        return ESP_FAIL;
+    }
+
+    if (passwd != NULL && strlen(passwd) > 0) {
+        ret = nvs_set_str(nvs_handle, NVS_KEY_PASS, passwd);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "[NVS] nvs_set_str(pass) failed: %s", esp_err_to_name(ret));
+            nvs_close(nvs_handle);
+            return ESP_FAIL;
+        }
+    }
+
+    ret = nvs_commit(nvs_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "[NVS] nvs_commit failed: %s", esp_err_to_name(ret));
+        nvs_close(nvs_handle);
+        return ESP_FAIL;
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "[NVS] credentials saved: ssid=%s", ssid);
+    return ESP_OK;
+}
+
+/**
  * @brief 连接到指定 SSID/密码
+ * @note 自动保存凭证到 NVS，下次启动自动恢复
  */
 esp_err_t wifi_manager_connect(const char *ssid, const char *passwd)
 {
@@ -148,20 +187,13 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *passwd)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // 保存到 NVS
-    nvs_handle_t nvs_handle;
-    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (ret == ESP_OK) {
-        nvs_set_str(nvs_handle, NVS_KEY_SSID, ssid);
-        if (passwd != NULL && strlen(passwd) > 0) {
-            nvs_set_str(nvs_handle, NVS_KEY_PASS, passwd);
-        }
-        nvs_commit(nvs_handle);
-        nvs_close(nvs_handle);
-        ESP_LOGI(TAG, "WiFi credentials saved to NVS");
+    /* 保存到 NVS */
+    esp_err_t nvs_ret = wifi_save_credentials(ssid, passwd);
+    if (nvs_ret != ESP_OK) {
+        ESP_LOGW(TAG, "[WIFI] NVS save failed — credentials will NOT persist after reboot");
     }
 
-    // 配置 WiFi
+    /* 配置 WiFi */
     memset(&s_wifi_config, 0, sizeof(wifi_config_t));
     strncpy((char *)s_wifi_config.sta.ssid, ssid, sizeof(s_wifi_config.sta.ssid) - 1);
     if (passwd != NULL) {
@@ -173,7 +205,13 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *passwd)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &s_wifi_config));
 
     // 启动 WiFi
-    return esp_wifi_start();
+    esp_err_t start_ret = esp_wifi_start();
+    if (start_ret == ESP_OK) {
+        /* 关闭 WiFi 省电模式 — 极大提升 TCP 上传吞吐 */
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+        ESP_LOGI(TAG, "[WIFI] Power save disabled (WIFI_PS_NONE)");
+    }
+    return start_ret;
 }
 
 /**
@@ -189,14 +227,28 @@ esp_err_t wifi_manager_restore_connection(void)
     nvs_handle_t nvs_handle;
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS");
+        ESP_LOGW(TAG, "[NVS] nvs_open(NVS_READONLY) failed: %s (0x%x)", esp_err_to_name(ret), ret);
+#if defined(CONFIG_WIFI_SSID) && defined(CONFIG_WIFI_PASSWORD)
+        ESP_LOGW(TAG, "[WIFI] NVS empty — connecting to menuconfig SSID (auth)");
+        return wifi_manager_connect(CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD);
+#elif defined(CONFIG_WIFI_SSID)
+        ESP_LOGW(TAG, "[WIFI] NVS empty — connecting to menuconfig SSID (open)");
+        return wifi_manager_connect(CONFIG_WIFI_SSID, NULL);
+#endif
         return ret;
     }
 
     ret = nvs_get_str(nvs_handle, NVS_KEY_SSID, ssid, &ssid_len);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "No saved SSID found");
         nvs_close(nvs_handle);
+#if defined(CONFIG_WIFI_SSID) && defined(CONFIG_WIFI_PASSWORD)
+        ESP_LOGW(TAG, "No saved SSID in NVS — using menuconfig WiFi settings");
+        return wifi_manager_connect(CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD);
+#elif defined(CONFIG_WIFI_SSID)
+        ESP_LOGW(TAG, "No saved SSID in NVS — using menuconfig SSID (open network)");
+        return wifi_manager_connect(CONFIG_WIFI_SSID, NULL);
+#endif
+        ESP_LOGW(TAG, "No saved SSID found");
         return ret;
     }
 

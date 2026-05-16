@@ -146,24 +146,9 @@ esp_err_t storage_build_vfs_path(char *buf, size_t size,
     /* 验证 */
     size_t actual = strlen(buf);
 
-    /* HEX DUMP：打印整个 buffer（不只看 strlen） */
-    printf("[PATH BUILD] buf=%p size=%u actual=%u snp_ret=%d\n",
-           (void*)buf, (unsigned)size, (unsigned)actual, snp_ret);
-    printf("  HEX:");
-    for (size_t i = 0; i < size; i++) {
-        printf(" %02X", (uint8_t)buf[i]);
-        if ((i + 1) % 32 == 0) printf("\n       ");
-    }
-    printf("\n");
-
-    ESP_LOGI(TAG,
-        "PATH CHECK: '%s' strlen=%u",
-        buf,
-        (unsigned)actual);
-
     /* 检查截断 */
     if (actual >= size - 1) {
-        ESP_LOGE(TAG, "PATH TRUNCATED");
+        ESP_LOGE(TAG, "PATH TRUNCATED: size=%u actual=%u", (unsigned)size, (unsigned)actual);
         return ESP_ERR_INVALID_SIZE;
     }
 

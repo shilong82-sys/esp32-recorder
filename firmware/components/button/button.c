@@ -152,44 +152,59 @@ static void button_task_entry(void *arg)
 {
     (void)arg;
     btn_evt_t evt;
+    int64_t last_diag_ms = 0;
 
     ESP_LOGI(TAG, "Button task started");
 
     while (1) {
         /* 等待事件队列（阻塞模式）*/
-        if (xQueueReceive(s_evt_queue, &evt, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(s_evt_queue, &evt, pdMS_TO_TICKS(5000)) == pdTRUE) {
             switch (evt.type) {
             case BTN_EVT_PRESSED:
+                ESP_LOGI(TAG, "[BTN_DBG] GPIO%d PRESSED (queue recv)", evt.gpio);
                 publish_event(EVENT_BUTTON_PRESSED, evt.gpio);
                 push_event(BUTTON_EVENT_PRESS);
                 break;
 
             case BTN_EVT_RELEASED:
+                ESP_LOGI(TAG, "[BTN_DBG] GPIO%d RELEASED (queue recv)", evt.gpio);
                 publish_event(EVENT_BUTTON_RELEASED, evt.gpio);
                 push_event(BUTTON_EVENT_RELEASE);
                 break;
 
             case BTN_EVT_CLICKED:
+                ESP_LOGI(TAG, "[BTN_DBG] GPIO%d CLICKED (queue recv)", evt.gpio);
                 publish_event(EVENT_BUTTON_CLICKED, evt.gpio);
                 push_event(BUTTON_EVENT_PRESS);  /* CLICK = 内部事件 */
                 break;
 
             case BTN_EVT_DOUBLE_CLICKED:
+                ESP_LOGI(TAG, "[BTN_DBG] GPIO%d DOUBLE_CLICKED (queue recv)", evt.gpio);
                 publish_event(EVENT_BUTTON_DOUBLE_CLICKED, evt.gpio);
                 push_event(BUTTON_EVENT_DOUBLE_CLICK);
                 break;
 
             case BTN_EVT_LONG_PRESSED:
+                ESP_LOGI(TAG, "[BTN_DBG] GPIO%d LONG_PRESSED (queue recv)", evt.gpio);
                 publish_event(EVENT_BUTTON_LONG_PRESSED, evt.gpio);
                 push_event(BUTTON_EVENT_LONG_PRESS);
                 break;
 
             case BTN_EVT_HOLD:
+                ESP_LOGI(TAG, "[BTN_DBG] GPIO%d HOLD (queue recv)", evt.gpio);
                 publish_event(EVENT_BUTTON_HOLD, evt.gpio);
                 break;
 
             default:
                 break;
+            }
+        } else {
+            /* 5秒超时：打印 GPIO 电平诊断（只在第一次或电平变化时打印） */
+            static int last_diag_level = -1;
+            int diag_level = gpio_get_level(s_buttons[0].gpio);
+            if (diag_level != last_diag_level) {
+                last_diag_level = diag_level;
+                ESP_LOGI(TAG, "[BTN_DBG] GPIO%d idle-level=%d (no events in 5s)", s_buttons[0].gpio, diag_level);
             }
         }
     }

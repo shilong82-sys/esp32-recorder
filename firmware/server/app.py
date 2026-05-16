@@ -22,8 +22,8 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 TRANSCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcripts")
 os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
 
-# 允许的最大文件大小：10MB
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
+# 允许的最大文件大小：100MB（RAW BODY 上传，支持大文件）
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
 
 @app.route('/')
@@ -86,31 +86,44 @@ def index():
 @app.route('/upload', methods=['POST'])
 def upload():
     """
-    接收 ESP32 上传的 WAV 文件
-    ESP32 使用 multipart/form-data 格式，字段名为 "file"
+    接收 ESP32 上传的 WAV 文件（RAW BODY，流式接收）
+    不使用 request.get_data()（会一次性读入内存导致超时）
+    直接读取 request.stream 流式写入文件
     """
-    if 'file' not in request.files:
-        print("❌ 请求中没有 'file' 字段")
-        return jsonify({"status": "error", "message": "No file field"}), 400
-    file = request.files['file']
-    if file.filename == '':
-        print("❌ 文件名为空")
-        return jsonify({"status": "error", "message": "Empty filename"}), 400
-
+    # 生成文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_name = f"{timestamp}_{file.filename}"
+    save_name = f"{timestamp}_upload.wav"
     save_path = os.path.join(SAVE_DIR, save_name)
 
-    file.save(save_path)
-    file_size = os.path.getsize(save_path)
+    # 流式读取 request body（不加载到内存）
+    bytes_received = 0
+    try:
+        with open(save_path, 'wb') as f:
+            # Flask 的 request.stream 是原始 WSGI input
+            # 使用 8KB chunk 读取，避免内存占用
+            chunk_size = 8192
+            while True:
+                chunk = request.stream.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                bytes_received += len(chunk)
 
-    print(f"✅ 接收文件成功：{save_name} （{file_size} bytes）")
+        file_size = os.path.getsize(save_path)
+        print(f"✅ 接收文件成功：{save_name} （{file_size} bytes）")
 
-    return jsonify({
-        "status": "success",
-        "filename": save_name,
-        "size_bytes": file_size
-    }), 200
+        return jsonify({
+            "status": "success",
+            "filename": save_name,
+            "size_bytes": file_size
+        }), 200
+
+    except Exception as e:
+        print(f"❌ 接收文件失败：{e}")
+        # 删除不完整的文件
+        if os.path.exists(save_path):
+            os.remove(save_path)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route('/whisper', methods=['POST'])

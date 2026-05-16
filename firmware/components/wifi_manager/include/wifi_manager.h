@@ -29,6 +29,14 @@ esp_err_t wifi_manager_init(void);
 esp_err_t wifi_manager_connect(const char *ssid, const char *passwd);
 
 /**
+ * @brief 保存 WiFi 凭证到 NVS（不触发连接）
+ * @param ssid WiFi 名称
+ * @param passwd WiFi 密码（可为 NULL 表示开放网络）
+ * @return ESP_OK=保存成功，ESP_FAIL=NVS 保存失败
+ */
+esp_err_t wifi_save_credentials(const char *ssid, const char *passwd);
+
+/**
  * @brief 从 NVS 恢复上次的连接
  * @return esp_err_t ESP_OK 表示成功恢复，ESP_FAIL 表示无保存的凭证
  */

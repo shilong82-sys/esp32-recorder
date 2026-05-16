@@ -60,9 +60,12 @@ typedef struct {
 
 static ui_context_t s_ctx = {0};
 
-/*————————————————————————————
+/* Forward declaration for esp_timer callback */
+static void override_timer_callback(void *arg);
+
+/*----------------------------
  * 内部：获取状态对应的 LED 配置
- *————————————————————————————*/
+ *----------------------------*/
 static const state_led_map_t* ui_get_map(device_state_t state)
 {
     for (size_t i = 0; i < sizeof(s_state_map) / sizeof(s_state_map[0]); i++) {
@@ -73,17 +76,17 @@ static const state_led_map_t* ui_get_map(device_state_t state)
     return &s_state_map[0]; /* fallback: INIT */
 }
 
-/*————————————————————————————
+/*----------------------------
  * 内部：应用一个 LED pattern
- *————————————————————————————*/
+ *----------------------------*/
 static void ui_apply_pattern(const led_pattern_config_t *cfg)
 {
     led_set_pattern(cfg);
 }
 
-/*————————————————————————————
+/*----------------------------
  * 内部：根据当前设备状态刷新 LED
- *————————————————————————————*/
+ *----------------------------*/
 static void ui_refresh_by_state(void)
 {
     if (s_ctx.initialized) {
@@ -100,21 +103,26 @@ static void ui_refresh_by_state(void)
     }
 }
 
-/*————————————————————————————
- * 覆盖定时器回调
- *————————————————————————————*/
+/* ============================================================
+ * 覆盖定时器回调（esp_timer task context）
+ *
+ * 规则：esp_timer callback 必须极轻量！
+ * 禁止：ESP_LOG 任何级别、printf、FATFS、malloc、event chain
+ * 允许：set flag、xTaskNotify、queue send
+ * ============================================================ */
 static void override_timer_callback(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "Override expired, restoring state-driven LED");
+    /* 只设置标志，不做任何重操作 */
     s_ctx.override_active = false;
     s_ctx.override_end_us = 0;
-    ui_refresh_by_state();
+    /* 注意：不在此处调用 ui_refresh_by_state()
+     * 改为由 ui_task 在下一个循环检测标志后刷新 */
 }
 
-/*————————————————————————————
+/*----------------------------
  * EVENT_STATE_CHANGED 回调
- *————————————————————————————*/
+ *----------------------------*/
 static void on_state_changed(event_type_t type, const void *data, size_t len, void *user_data)
 {
     (void)type; (void)len; (void)user_data;
@@ -133,9 +141,9 @@ static void on_state_changed(event_type_t type, const void *data, size_t len, vo
     ui_refresh_by_state();
 }
 
-/*————————————————————————————
+/*----------------------------
  * UI 任务入口
- *————————————————————————————*/
+ *----------------------------*/
 static void ui_task_entry(void *arg)
 {
     (void)arg;
@@ -151,15 +159,23 @@ static void ui_task_entry(void *arg)
     /* 初始化时应用一次当前状态 */
     ui_refresh_by_state();
 
-    /* 任务主循环（空循环，等待事件驱动）*/
+    /* 任务主循环：事件驱动 + 定时检查覆盖结束 */
+    bool prev_override = s_ctx.override_active;
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));  /* 1s 空循环，刷新由事件触发 */
+        /* 检查覆盖是否结束（由 esp_timer callback 设置标志） */
+        if (prev_override && !s_ctx.override_active) {
+            /* 覆盖刚结束，恢复状态驱动 LED */
+            ui_refresh_by_state();
+            ESP_LOGI(TAG, "Override expired, restored state-driven LED");
+        }
+        prev_override = s_ctx.override_active;
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-/*————————————————————————————
+/*----------------------------
  * ui_init
- *————————————————————————————*/
+ *----------------------------*/
 esp_err_t ui_init(void)
 {
     if (s_ctx.initialized) {
@@ -202,9 +218,9 @@ esp_err_t ui_init(void)
     return ESP_OK;
 }
 
-/*————————————————————————————
+/*----------------------------
  * ui_led_override
- *————————————————————————————*/
+ *----------------------------*/
 esp_err_t ui_led_override(led_pattern_t pattern, uint8_t r, uint8_t g, uint8_t b, uint32_t duration_ms)
 {
     if (!s_ctx.initialized) {
@@ -242,9 +258,9 @@ esp_err_t ui_led_override(led_pattern_t pattern, uint8_t r, uint8_t g, uint8_t b
     return ESP_OK;
 }
 
-/*————————————————————————————
+/*----------------------------
  * ui_led_override_cancel
- *————————————————————————————*/
+ *----------------------------*/
 void ui_led_override_cancel(void)
 {
     if (!s_ctx.initialized) return;

@@ -58,8 +58,13 @@ static bool s_initialized = false;
  *
  * 注意：在 esp_timer task (~3.5KB 栈) 上运行不安全！
  *————————————————————————————*/
+#define MONITOR_TASK_STACK      (8192)      /* 8KB：为 vTaskList + ESP_LOGI 留足空间 */
+
 static void dump_all_tasks(void)
 {
+    /* vTaskList 输出缓冲：32字节/任务 × 20任务 = 640B */
+    /* ESP_LOGI 格式化：~800B */
+    /* 总计 < 1.5KB，8KB 栈完全够用 */
     static char vlist_buf[2048];
 
     vTaskList(vlist_buf);
@@ -102,15 +107,15 @@ static void dump_task_watermarks(void)
         "audio",            /* 5 chars  */
     };
     static const uint32_t known_stacks[] = {
-        4096,      /* sys_mon: monitor_task 栈 */
+        8192,      /* sys_mon: monitor_task 栈 (已扩容 1KB→8KB) */
         8192,      /* ui: UI_TASK_STACK_SIZE */
         5120,      /* main: ESP_MAIN_TASK_STACK_SIZE */
-        3584,      /* esp_timer: ESP_TIMER_TASK_STACK_SIZE */
+        5120,      /* esp_timer: ESP_TIMER_TASK_STACK_SIZE */
         1536,      /* IDLE: FREERTOS_IDLE_TASK_STACKSIZE */
         2048,      /* Tmr Svc: FREERTOS_TIMER_TASK_STACK_DEPTH */
         4096,      /* wifi_rec: wifi_manager 重连任务栈 */
-        1024,      /* ipc0: CONFIG_ESP_IPC_TASK_STACK_SIZE */
-        1024,      /* ipc1 */
+        1280,      /* ipc0: CONFIG_ESP_IPC_TASK_STACK_SIZE */
+        1280,      /* ipc1 */
         8192,      /* recorder: RECORDER_TASK_STACK */
         8192,      /* audio: AUDIO_TASK_STACK */
     };
@@ -157,7 +162,7 @@ static void dump_task_watermarks(void)
 static void monitor_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "monitor_task started (stack=%u bytes)", (unsigned)(configMINIMAL_STACK_SIZE * sizeof(StackType_t)));
+    ESP_LOGI(TAG, "monitor_task started (stack=%u bytes)", (unsigned)MONITOR_TASK_STACK);
 
     while (1) {
         /* 等待 timer callback 发来的信号（永久阻塞，安全）*/
@@ -209,11 +214,11 @@ esp_err_t system_monitor_init(uint32_t interval_ms)
         return ESP_FAIL;
     }
 
-    /* 创建 monitor_task（4KB 栈，专门用于 vTaskList） */
+    /* 创建 monitor_task（8KB 栈，专门用于 vTaskList） */
     BaseType_t created = xTaskCreatePinnedToCore(
         &monitor_task,
         "sys_mon",
-        configMINIMAL_STACK_SIZE * 2,  /* 4KB 栈：足够 vTaskList() */
+        MONITOR_TASK_STACK,  /* 8KB：为 vTaskList + ESP_LOGI 格式化留足余量 */
         NULL,
         1,      /* 低优先级，让出 CPU 给业务任务 */
         &s_monitor_task_handle,

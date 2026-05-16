@@ -5,7 +5,7 @@
  * 目录职责：
  * - recordings/   : recorder 唯一写入，WAV finalize 后 rename 到 upload_queue/
  * - upload_queue/ : uploader 唯一输入，只包含 finalized WAV 文件
- * - uploaded/     : 上传成功归档（rename，不是 delete）
+ * - 上传成功后：删除 upload_queue/ 中的文件（不保留副本）
  *
  * 设计原则：
  * - uploader_task 独立运行，不在 recorder task 内
@@ -20,7 +20,9 @@
 #include "wifi_manager.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
-#include "esp_random.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <errno.h>
 #include <string.h>
 #include <time.h>
@@ -31,22 +33,21 @@
 static const char *TAG = "uploader";
 
 /*======================================================================
- * Log Tags (per spec: [UPLOAD][QUEUE][ARCHIVE][RETRY][WIFI_WAIT])
+ * Log Tags
  *======================================================================*/
 #define LOG_QUEUE(...)  ESP_LOGI(TAG, "[QUEUE] " __VA_ARGS__)
 #define LOG_ARCHIVE(...) ESP_LOGI(TAG, "[ARCHIVE] " __VA_ARGS__)
-#define LOG_RETRY(...)  ESP_LOGW(TAG, "[RETRY] " __VA_ARGS__)
+#define LOG_RETRY(...)  ESP_LOGW(TAG, "[UPLOAD_RETRY] " __VA_ARGS__)
 #define LOG_WIFI(...)   ESP_LOGI(TAG, "[WIFI_WAIT] " __VA_ARGS__)
 
 /*======================================================================
  * Constants
  *======================================================================*/
 #define UPLOADER_TASK_STACK   (8192)
-#define UPLOADER_TASK_PRIORITY (2)       /* 低于 audio_task(3) 和 recorder_task(3) */
+#define UPLOADER_TASK_PRIORITY (2)
 #define UPLOADER_TASK_CORE     (0)
 
-#define POLL_INTERVAL_MS        (2000)    /* 每 2s 扫描一次队列 */
-#define CHUNK_SIZE              (4096)
+#define POLL_INTERVAL_MS        (2000)
 
 /* 重试间隔：3s → 10s → 30s */
 static const uint32_t RETRY_DELAYS_MS[] = { 3000, 10000, 30000 };
@@ -56,81 +57,19 @@ static const uint32_t RETRY_DELAYS_MS[] = { 3000, 10000, 30000 };
  * State
  *======================================================================*/
 static TaskHandle_t s_task_handle = NULL;
-static bool s_wifi_ok = false;           /* WiFi 是否可用（由 wifi_manager 回调设置）*/
-static bool s_paused = false;           /* 暂停标志（WiFi 断开时置 true）*/
-static uploader_config_t s_config = {
-    .server_ip   = {0},
-    .server_port = 8000,
-    .upload_path = "/upload",
-    .timeout_ms  = 30000,
-};
+static bool s_wifi_ok = false;
+static bool s_paused = false;
+
+/*======================================================================
+ * HTTP Event State
+ *======================================================================*/
+static char s_last_err_detail[512] = {0};
+static char s_response_body[256]   = {0};
+static int  s_response_body_len     = 0;
 
 /*======================================================================
  * Internal Helpers
  *======================================================================*/
-
-/**
- * Check if a file exists in a given storage path directory.
- */
-static bool file_exists_in_dir(storage_path_type_t type, const char *filename)
-{
-    char vfs_path[128];
-    if (storage_build_vfs_path(vfs_path, sizeof(vfs_path), type, filename) != ESP_OK) {
-        return false;
-    }
-    struct stat st;
-    return (stat(vfs_path, &st) == 0 && S_ISREG(st.st_mode));
-}
-
-/**
- * Generate a safe archive filename for uploaded/ directory.
- *
- * If filename already exists in uploaded/ (e.g., from previous upload cycle),
- * append Unix timestamp: REC_SESSION_xxxx_1712345678.wav
- */
-static void safe_archive_name(const char *src_filename, char *out_safe, size_t out_size)
-{
-    if (out_size < 64) return;
-
-    if (!file_exists_in_dir(STORAGE_PATH_UPLOADED, src_filename)) {
-        snprintf(out_safe, out_size, "%s", src_filename);
-        return;
-    }
-
-    /* Extract base id: "REC_SESSION_0013.wav" -> base = "REC_SESSION_0013" */
-    char base[64];
-    size_t name_len = strlen(src_filename);
-    if (name_len > 4 && name_len < sizeof(base)) {
-        memcpy(base, src_filename, name_len - 4);  /* strip ".wav" */
-        base[name_len - 4] = '\0';
-    } else {
-        snprintf(base, sizeof(base), "%.*s", (int)(name_len - 4), src_filename);
-    }
-
-        /* Try: REC_SESSION_xxxx_TS.wav with incrementing suffix if needed */
-        for (unsigned int ts_suffix = 0; ts_suffix <= 999; ts_suffix++) {
-            time_t now = time(NULL);
-            uint32_t ts = (uint32_t)now;
-            char candidate[96];
-            if (ts_suffix == 0) {
-                snprintf(candidate, sizeof(candidate), "%s_%lu.wav", base, (unsigned long)ts);
-            } else {
-                snprintf(candidate, sizeof(candidate), "%s_%lu_%u.wav", base, (unsigned long)ts, ts_suffix);
-            }
-
-        if (!file_exists_in_dir(STORAGE_PATH_UPLOADED, candidate)) {
-            LOG_ARCHIVE("collision: %s -> %s", src_filename, candidate);
-            snprintf(out_safe, out_size, "%s", candidate);
-            return;
-        }
-    }
-
-    /* Fallback: use random suffix */
-    uint32_t rnd = esp_random();
-    char fallback[96];
-    snprintf(fallback, sizeof(fallback), "%s_r%08lx.wav", base, (unsigned long)rnd);
-    snprintf(out_safe, out_size, "%s", fallback);
-}
 
 /**
  * 获取 upload_queue/ 中第一个 WAV 文件（按字母序 = FIFO）
@@ -171,154 +110,264 @@ static bool get_next_file(char *buf, size_t buf_size)
     return false;
 }
 
-/**
- * HTTP 事件处理器（debug 级日志，不打印正常流程）
- */
+/*======================================================================
+ * HTTP Event Handler — 收集详细错误和响应体
+ *======================================================================*/
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
     case HTTP_EVENT_ERROR:
-        ESP_LOGD(TAG, "[UPLOAD] HTTP_ERROR");
+        ESP_LOGD(TAG, "[HTTP] ERROR");
+        if (evt->data && evt->data_len > 0) {
+            size_t len = strlen(s_last_err_detail);
+            int cap = sizeof(s_last_err_detail) - (int)len - 1;
+            if (cap > 0) {
+                snprintf(s_last_err_detail + len, (size_t)cap,
+                         "%.*s", (int)evt->data_len, (char *)evt->data);
+            }
+        }
         break;
+
     case HTTP_EVENT_ON_CONNECTED:
-        ESP_LOGD(TAG, "[UPLOAD] CONNECTED");
+        ESP_LOGI(TAG, "[HTTP] TCP connected");
         break;
-    case HTTP_EVENT_ON_DATA:
-        ESP_LOGD(TAG, "[UPLOAD] ON_DATA len=%d", evt->data_len);
+
+    case HTTP_EVENT_HEADERS_SENT:
+        ESP_LOGD(TAG, "[HTTP] HEADERS SENT");
         break;
+
+    case HTTP_EVENT_ON_HEADER:
+        ESP_LOGD(TAG, "[HTTP] HEADER: %s: %s",
+                 evt->header_key ? evt->header_key : "(null)",
+                 evt->header_value ? evt->header_value : "(null)");
+        break;
+
+    case HTTP_EVENT_ON_DATA: {
+        if (evt->data && evt->data_len > 0 &&
+            s_response_body_len < (int)(sizeof(s_response_body) - 1)) {
+            int cap = (int)(sizeof(s_response_body) - (size_t)s_response_body_len - 1);
+            int copy = (evt->data_len < (size_t)cap) ? (int)evt->data_len : cap;
+            memcpy(s_response_body + s_response_body_len, evt->data, (size_t)copy);
+            s_response_body_len += copy;
+            s_response_body[s_response_body_len] = '\0';
+        }
+        ESP_LOGD(TAG, "[HTTP] ON_DATA len=%d  resp_body_len=%d",
+                 evt->data_len, s_response_body_len);
+        break;
+    }
+
+    case HTTP_EVENT_ON_FINISH:
+        ESP_LOGI(TAG, "[HTTP] RESPONSE FINISH");
+        break;
+
     case HTTP_EVENT_DISCONNECTED:
-        ESP_LOGD(TAG, "[UPLOAD] DISCONNECTED");
+        ESP_LOGD(TAG, "[HTTP] DISCONNECTED");
         break;
+
     default:
         break;
     }
     return ESP_OK;
 }
 
+/*======================================================================
+ * Upload — HTTP (Cloudflare Tunnel) — RAW BODY (audio/wav)
+ *======================================================================*/
+
+#define UPLOAD_URL            "http://record.east-deep.com/upload"
+#define UPLOAD_CHUNK_SIZE     (8 * 1024)   /* 8KB chunk size */
+
 /**
- * 上传单个文件
+ * 上传单个文件 (HTTP raw body — Content-Type: audio/wav)
+ *
+ * 实现方式：esp_http_client_open() + esp_http_client_write() 流式发送。
+ * - 不 malloc 完整 body，RAM 占用 < 20KB
+ * - 支持 100MB+ 录音文件
+ * - 无 multipart，直接发送 wav binary
+ *
  * @param filename upload_queue/ 中的文件名（不含路径）
- * @return ESP_OK=成功，ESP_FAIL=失败
+ * @return ESP_OK=成功（HTTP 200），ESP_FAIL=失败
  */
 static esp_err_t do_upload(const char *filename)
 {
+    /* ── 计时起点 ── */
+    int64_t t_start_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    /* ── 文件检查 ── */
     char full_path[128];
-    storage_build_vfs_path(full_path, sizeof(full_path), STORAGE_PATH_UPLOAD_QUEUE, filename);
+    storage_build_vfs_path(full_path, sizeof(full_path),
+                             STORAGE_PATH_UPLOAD_QUEUE, filename);
 
     struct stat st;
     if (stat(full_path, &st) != 0) {
-        ESP_LOGE(TAG, "[UPLOAD] file not found: %s errno=%d", full_path, errno);
+        ESP_LOGE(TAG, "[UPLOAD] file not found: %s errno=%d",
+                 full_path, errno);
         return ESP_FAIL;
     }
     uint32_t file_size = (uint32_t)st.st_size;
 
-    ESP_LOGI(TAG, "[UPLOAD] start");
-    ESP_LOGI(TAG, "[UPLOAD] filename=%s", filename);
-    ESP_LOGI(TAG, "[UPLOAD] size=%lu bytes", (unsigned long)file_size);
+    ESP_LOGI(TAG, "[UPLOAD] =======================");
+    ESP_LOGI(TAG, "[UPLOAD] filename  : %s", filename);
+    ESP_LOGI(TAG, "[UPLOAD] file_size : %lu bytes", (unsigned long)file_size);
+    ESP_LOGI(TAG, "[UPLOAD] heap_free : %lu bytes",
+             (unsigned long)esp_get_free_heap_size());
 
-    /* 构建 URL */
-    char url[256];
-    snprintf(url, sizeof(url), "http://%s:%d%s",
-             s_config.server_ip, s_config.server_port, s_config.upload_path);
+    /* ── 重置响应状态 ── */
+    s_last_err_detail[0] = '\0';
+    s_response_body[0]    = '\0';
+    s_response_body_len    = 0;
 
-    /* 打开文件 */
-    FILE *fp = fopen(full_path, "rb");
-    if (fp == NULL) {
-        ESP_LOGE(TAG, "[UPLOAD] fopen failed: %s errno=%d (%s)",
-                 full_path, errno, strerror(errno));
+    /* ── total_len = 文件大小（无 multipart 开销） ── */
+    size_t total_len = (size_t)file_size;
+    ESP_LOGI(TAG, "[HTTP] total_len  : %zu bytes (raw wav)", total_len);
+
+    /* ── 分配 16KB 循环 buffer ── */
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(UPLOAD_CHUNK_SIZE, MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        ESP_LOGE(TAG, "[UPLOAD] cannot malloc %d bytes for chunk buffer",
+                     UPLOAD_CHUNK_SIZE);
+        ESP_LOGE(TAG, "[UPLOAD] heap_free=%lu  largest_block=%lu",
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         return ESP_FAIL;
     }
 
-    /* HTTP 客户端配置 */
+    /* ── HTTP 客户端配置 ── */
     esp_http_client_config_t http_config = {
-        .url           = url,
+        .url           = UPLOAD_URL,
         .event_handler = http_event_handler,
-        .timeout_ms    = s_config.timeout_ms,
         .method        = HTTP_METHOD_POST,
+        .timeout_ms    = 600000,  /* 10 分钟，支持慢速上传 */
     };
+
     esp_http_client_handle_t client = esp_http_client_init(&http_config);
     if (client == NULL) {
-        ESP_LOGE(TAG, "[UPLOAD] esp_http_client_init failed: %p", client);
-        fclose(fp);
+        ESP_LOGE(TAG, "[UPLOAD] esp_http_client_init FAILED");
+        free(buf);
         return ESP_FAIL;
     }
 
-    /* multipart/form-data */
-    const char *boundary = "----ESP32Boundary123456789";
-    char content_type[64];
-    snprintf(content_type, sizeof(content_type),
-             "multipart/form-data; boundary=%s", boundary);
-    esp_http_client_set_header(client, "Content-Type", content_type);
+    /* ── 设置 Content-Type: audio/wav（无 multipart） ── */
+    esp_http_client_set_header(client, "Content-Type", "audio/wav");
 
-    /* 开始请求 */
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "[UPLOAD] open failed: %s errno=%d",
-                 esp_err_to_name(err), errno);
+    /* ── 打开连接，Content-Length = file_size ── */
+    esp_err_t open_err = esp_http_client_open(client, (int)total_len);
+    if (open_err != ESP_OK) {
+        ESP_LOGE(TAG, "[UPLOAD] open failed: %s",
+                 esp_err_to_name(open_err));
         esp_http_client_cleanup(client);
-        fclose(fp);
+        free(buf);
         return ESP_FAIL;
     }
 
-    /* 发送 multipart 头（RFC 2046 CRLF） */
-    char header[512];
-    int header_len = snprintf(header, sizeof(header),
-        "--%s\r\n"
-        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
-        "Content-Type: audio/wav\r\n"
-        "\r\n",
-        boundary, filename);
-    int w = esp_http_client_write(client, header, header_len);
-    if (w < 0) {
-        ESP_LOGE(TAG, "[UPLOAD] header write failed: %s", esp_err_to_name(w));
+    /* ── 流式写 wav 文件（无 header/footer） ── */
+    FILE *fp = fopen(full_path, "rb");
+    if (fp == NULL) {
+        ESP_LOGE(TAG, "[UPLOAD] fopen failed: %s errno=%d",
+                 full_path, errno);
+        esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        fclose(fp);
+        free(buf);
         return ESP_FAIL;
     }
 
-    /* 发送文件内容 */
-    uint8_t buf[CHUNK_SIZE];
-    size_t bytes_read;
-    uint32_t total_sent = 0;
-    while ((bytes_read = fread(buf, 1, CHUNK_SIZE, fp)) > 0) {
-        int written = esp_http_client_write(client, (const char *)buf, bytes_read);
-        if (written < 0) {
-            ESP_LOGE(TAG, "[UPLOAD] body write failed: %s errno=%d",
-                     esp_err_to_name(written), errno);
-            esp_http_client_cleanup(client);
+    uint32_t total_sent   = 0;
+    uint32_t last_log_bytes = 0;
+    size_t   nread;
+
+    while ((nread = fread(buf, 1, UPLOAD_CHUNK_SIZE, fp)) > 0) {
+        int nw = esp_http_client_write(client, (char *)buf, (int)nread);
+        if (nw != (int)nread) {
+            ESP_LOGE(TAG, "[UPLOAD] write: expected %zu, got %d",
+                     nread, nw);
             fclose(fp);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            free(buf);
             return ESP_FAIL;
         }
-        total_sent += written;
-    }
+        total_sent += (uint32_t)nread;
 
-    int fread_err = ferror(fp);
-    if (fread_err != 0) {
-        ESP_LOGE(TAG, "[UPLOAD] fread error: errno=%d (%s)",
-                 fread_err, strerror(fread_err));
-        clearerr(fp);
-        fclose(fp);
-        esp_http_client_cleanup(client);
-        return ESP_FAIL;
+        /* 每发送 512KB 打印一次进度 */
+        if (total_sent - last_log_bytes >= 512 * 1024 ||
+            total_sent == file_size) {
+            int64_t now_ms     = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+            int64_t elapsed_ms = now_ms - t_start_ms;
+            float   speed_kbps = (elapsed_ms > 0)
+                            ? ((float)total_sent / (float)elapsed_ms)
+                            : 0.0f;
+            ESP_LOGI(TAG, "[UPLOAD] progress : %lu / %lu bytes  (%.1f KB/s)",
+                     (unsigned long)total_sent,
+                     (unsigned long)file_size, speed_kbps);
+            last_log_bytes = total_sent;
+        }
     }
     fclose(fp);
 
-    /* 发送结束标记 */
-    char footer[64];
-    int footer_len = snprintf(footer, sizeof(footer), "\r\n--%s--\r\n", boundary);
-    esp_http_client_write(client, footer, footer_len);
+    if (total_sent != file_size) {
+        ESP_LOGE(TAG, "[UPLOAD] fread mismatch: sent %lu, expected %lu",
+                 (unsigned long)total_sent, (unsigned long)file_size);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        free(buf);
+        return ESP_FAIL;
+    }
 
-    /* 获取状态码 */
+    ESP_LOGI(TAG, "[HTTP] body sent  : %lu bytes",
+             (unsigned long)total_sent);
+    ESP_LOGI(TAG, "[HTTP] waiting for response...");
+
+    /* ── 接收服务器响应 ── */
+    esp_err_t fetch_err = esp_http_client_fetch_headers(client);
     int status = esp_http_client_get_status_code(client);
+
+    /* ── 释放循环 buffer ── */
+    free(buf);
+
+    /* ── 关闭连接 ── */
+    esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
-    ESP_LOGI(TAG, "[UPLOAD] http_code=%d", status);
+    /* ── 计时结束 ── */
+    int64_t t_end_ms   = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+    int64_t duration_ms = t_end_ms - t_start_ms;
 
-    if (status >= 200 && status < 300) {
-        ESP_LOGI(TAG, "[UPLOAD] success: %s", filename);
+    /* ── 日志报告 ── */
+    float speed_kbps = (duration_ms > 0)
+                    ? ((float)total_sent / (float)duration_ms)
+                    : 0.0f;
+    ESP_LOGI(TAG, "[HTTP] HTTP status : %d", status);
+    if (s_response_body_len > 0) {
+        ESP_LOGI(TAG, "[HTTP] resp_body   : %.*s",
+                 s_response_body_len, s_response_body);
+    } else {
+        ESP_LOGI(TAG, "[HTTP] resp_body   : (empty)");
+    }
+    ESP_LOGI(TAG, "[UPLOAD] sent       : %lu bytes",
+             (unsigned long)total_sent);
+    ESP_LOGI(TAG, "[UPLOAD] elapsed    : %lld ms",
+             (long long)duration_ms);
+    ESP_LOGI(TAG, "[UPLOAD] speed      : %.1f KB/s", speed_kbps);
+    ESP_LOGI(TAG, "[UPLOAD] heap_free  : %lu bytes",
+             (unsigned long)esp_get_free_heap_size());
+
+    /* ── 判定结果：HTTP 200 = 删除本地文件 ── */
+    if (status == 200) {
+        ESP_LOGI(TAG, "[UPLOAD_OK] %s HTTP 200 %lldms",
+                 filename, (long long)duration_ms);
+        if (unlink(full_path) == 0) {
+            ESP_LOGI(TAG, "[UPLOAD] deleted: %s", full_path);
+        } else {
+            ESP_LOGW(TAG, "[UPLOAD] unlink failed: %s errno=%d (%s)",
+                     full_path, errno, strerror(errno));
+        }
         return ESP_OK;
     } else {
-        ESP_LOGE(TAG, "[UPLOAD] failed: %s http=%d", filename, status);
+        if (fetch_err != ESP_OK) {
+            ESP_LOGE(TAG, "[UPLOAD] fetch_headers: %s",
+                     esp_err_to_name(fetch_err));
+        }
+        ESP_LOGE(TAG, "[UPLOAD_FAIL] %s HTTP %d", filename, status);
         return ESP_FAIL;
     }
 }
@@ -351,6 +400,7 @@ static void uploader_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG, "uploader_task started (poll=%dms)", POLL_INTERVAL_MS);
+    ESP_LOGI(TAG, "  HTTP URL: " UPLOAD_URL);
 
     /* 初始状态检查 */
     s_wifi_ok = wifi_manager_is_connected();
@@ -380,7 +430,7 @@ static void uploader_task(void *arg)
             continue;
         }
 
-        LOG_QUEUE("found: %s — starting upload", filename);
+        LOG_QUEUE("queued: %s", filename);
 
         /* 4. 上传 + 重试 */
         esp_err_t upload_err = ESP_FAIL;
@@ -388,10 +438,10 @@ static void uploader_task(void *arg)
         uint32_t delay_ms = 0;
 
         while (retry_count < RETRY_MAX) {
-            /* 首次尝试不等待，后续等待 interval */
             if (retry_count > 0) {
                 LOG_RETRY("attempt %u for %s — wait %lums",
-                          (unsigned)retry_count, filename, (unsigned long)delay_ms);
+                          (unsigned)retry_count, filename,
+                          (unsigned long)delay_ms);
                 vTaskDelay(pdMS_TO_TICKS(delay_ms));
 
                 /* 等待期间检查 WiFi */
@@ -413,30 +463,13 @@ static void uploader_task(void *arg)
 
         /* 5. 处理结果 */
         if (upload_err == ESP_OK) {
-            /* 归档：rename upload_queue/ -> uploaded/ (安全命名，防止冲突) */
-            char safe_name[64];
-            safe_archive_name(filename, safe_name, sizeof(safe_name));
-
-            ESP_LOGI(TAG, "[ARCHIVE] %s -> uploaded/%s", filename, safe_name);
-
-            esp_err_t arch_err = storage_rename_file(
-                STORAGE_PATH_UPLOAD_QUEUE, filename,
-                STORAGE_PATH_UPLOADED, safe_name);
-
-            if (arch_err != ESP_OK) {
-                /* 归档失败不应该删除，保留原文件 */
-                ESP_LOGE(TAG, "[ARCHIVE] rename failed: %s errno=%d (%s) — file kept in upload_queue/",
-                         filename, errno, strerror(errno));
-            } else {
-                LOG_ARCHIVE("uploaded/%s", safe_name);
-            }
+            /* do_upload 已负责删除文件，这里只打印日志 */
+            LOG_ARCHIVE("uploaded: %s", filename);
         } else {
             /* 全部重试失败：保留文件，等待下一轮扫描 */
             ESP_LOGW(TAG, "[QUEUE] %s failed all %u retries — will retry next scan cycle",
                      filename, (unsigned)RETRY_MAX);
         }
-
-        /* 循环会自动继续扫描下一个文件 */
     }
 }
 
@@ -447,11 +480,12 @@ static void uploader_task(void *arg)
 esp_err_t uploader_init(const uploader_config_t *config)
 {
     if (config != NULL) {
-        memcpy(&s_config, config, sizeof(uploader_config_t));
+        /* 不再使用 s_config，URL 硬编码在 UPLOAD_URL */
+        (void)config;
     }
 
     ESP_LOGI(TAG, "Uploader initialized");
-    ESP_LOGI(TAG, "  Server: %s:%d%s", s_config.server_ip, s_config.server_port, s_config.upload_path);
+    ESP_LOGI(TAG, "  URL: " UPLOAD_URL);
     ESP_LOGI(TAG, "  Retry delays: %lu/%lu/%lu ms",
              (unsigned long)RETRY_DELAYS_MS[0],
              (unsigned long)RETRY_DELAYS_MS[1],
@@ -460,7 +494,8 @@ esp_err_t uploader_init(const uploader_config_t *config)
     /* 注册 WiFi 状态回调 */
     esp_err_t ret = wifi_manager_register_callback(on_wifi_status, NULL);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "wifi_manager_register_callback failed: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "wifi_manager_register_callback failed: %s",
+                     esp_err_to_name(ret));
     }
 
     return ESP_OK;
@@ -492,7 +527,8 @@ esp_err_t uploader_start(void)
     return ESP_OK;
 }
 
-esp_err_t uploader_upload(const char *file_path, char *out_response, size_t response_size)
+esp_err_t uploader_upload(const char *file_path,
+                          char *out_response, size_t response_size)
 {
     /* 单次上传接口已废弃（队列模式），保留仅用于兼容 */
     (void)file_path;
@@ -509,7 +545,7 @@ int uploader_get_progress(void)
 
 esp_err_t uploader_delete_after_upload(const char *file_path)
 {
-    /* 归档改为 rename，不删除。保留此函数仅作兼容。 */
+    /* 上传成功后直接 unlink，此函数仅作兼容 */
     (void)file_path;
     return ESP_OK;
 }
