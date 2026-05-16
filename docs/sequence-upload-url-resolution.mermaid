@@ -1,0 +1,22 @@
+sequenceDiagram
+    participant app_main
+    participant uploader
+    participant NVS
+
+    app_main->>uploader: uploader_init(&config)
+    uploader->>uploader: resolve_upload_url()
+    alt config.upload_url 非空
+        uploader->>uploader: 使用 config.upload_url
+    else config.server_ip 非空
+        uploader->>uploader: 拼接 http://ip:port/path
+    end
+    uploader->>NVS: nvs_get("uploader", "upload_url")
+    alt NVS 有值
+        NVS-->>uploader: 返回 NVS URL（覆盖）
+        uploader->>uploader: s_upload_url = NVS URL
+    end
+    uploader->>uploader: 打印最终 URL
+    uploader->>uploader: 注册 WiFi 回调
+    uploader-->>app_main: ESP_OK
+
+    Note over uploader: 后续可通过 uploader_set_url() 修改 NVS

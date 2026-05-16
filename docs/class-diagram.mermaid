@@ -1,0 +1,87 @@
+classDiagram
+    class uploader_config_t {
+        +char upload_url[128]
+        +char server_ip[32]
+        +uint16_t server_port
+        +char upload_path[64]
+        +uint32_t timeout_ms
+    }
+
+    class uploader_module {
+        -static char s_upload_url[128]
+        -static bool s_wifi_ok
+        -static bool s_paused
+        -static TaskHandle_t s_task_handle
+        +uploader_init(config: uploader_config_t*) esp_err_t
+        +uploader_start() esp_err_t
+        +uploader_set_url(url: char*) esp_err_t
+        +uploader_get_url() char*
+        -resolve_upload_url(config: uploader_config_t*) void
+        -load_url_from_nvs() esp_err_t
+        -save_url_to_nvs(url: char*) esp_err_t
+        -do_upload(filename: char*) esp_err_t
+        -get_next_file(buf: char*, buf_size: size_t) bool
+        -on_wifi_status(connected: bool, user_data: void*) void
+    }
+
+    class event_upload_progress_data_t {
+        +int progress_percent
+        +uint32_t bytes_sent
+        +uint32_t bytes_total
+    }
+
+    class event_upload_result_data_t {
+        +char filename[64]
+        +bool success
+        +int http_status
+    }
+
+    uploader_module --> uploader_config_t : uses
+    uploader_module --> event_upload_progress_data_t : publishes
+    uploader_module --> event_upload_result_data_t : publishes
+
+    class File {
+        +int id PK
+        +str filename
+        +str saved_name UK
+        +int file_size
+        +datetime upload_time
+        +str upload_src
+        +datetime created_at
+    }
+
+    class Transcription {
+        +int id PK
+        +int file_id FK
+        +str status
+        +str text
+        +str model
+        +str language
+        +float duration
+        +str error_msg
+        +datetime started_at
+        +datetime completed_at
+        +datetime created_at
+    }
+
+    File "1" --> "0..1" Transcription : has
+
+    class TranscriberService {
+        -asyncio.Queue task_queue
+        -bool is_processing
+        +start() void
+        +enqueue(file_id: int) void
+        -_worker() void
+        -_transcribe(file_id: int) void
+    }
+
+    class AppConfig {
+        +int port
+        +str host
+        +str received_dir
+        +str transcripts_dir
+        +str db_path
+        +str whisper_model
+        +int max_file_size_mb
+        +int transcribe_timeout_s
+    }

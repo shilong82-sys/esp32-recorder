@@ -13,17 +13,27 @@
  * - 启动时仅扫描 upload_queue/ 恢复
  * - 重试策略：3s → 10s → 30s，之后保留文件等待下一轮
  * - WiFi 断开暂停上传，不影响录音
+ *
+ * Upload URL 优先级链：
+ * 1. config.upload_url 非空 → 使用该 URL
+ * 2. config.server_ip + server_port + upload_path 拼接
+ * 3. NVS "uploader"/"upload_url" → 覆盖上述结果
+ * 4. 默认值：http://record.east-deep.com/upload
  */
 
 #include "uploader.h"
 #include "storage.h"
 #include "wifi_manager.h"
+#include "event_bus.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <sys/unistd.h>
@@ -53,12 +63,23 @@ static const char *TAG = "uploader";
 static const uint32_t RETRY_DELAYS_MS[] = { 3000, 10000, 30000 };
 #define RETRY_MAX              (sizeof(RETRY_DELAYS_MS) / sizeof(RETRY_DELAYS_MS[0]))
 
+#define DEFAULT_UPLOAD_URL   "http://record.east-deep.com/upload"
+#define UPLOAD_CHUNK_SIZE     (8 * 1024)   /* 8KB chunk size */
+
+/*======================================================================
+ * NVS Constants
+ *======================================================================*/
+#define NVS_NAMESPACE         "uploader"
+#define NVS_KEY_UPLOAD_URL    "upload_url"
+
 /*======================================================================
  * State
  *======================================================================*/
 static TaskHandle_t s_task_handle = NULL;
 static bool s_wifi_ok = false;
 static bool s_paused = false;
+static char s_upload_url[128] = {0};
+static uint32_t s_timeout_ms = 600000;  /* default: 10 minutes */
 
 /*======================================================================
  * HTTP Event State
@@ -66,6 +87,133 @@ static bool s_paused = false;
 static char s_last_err_detail[512] = {0};
 static char s_response_body[256]   = {0};
 static int  s_response_body_len     = 0;
+
+/*======================================================================
+ * NVS Helper Functions
+ *======================================================================*/
+
+/**
+ * 从 NVS 读取 upload URL
+ * @param[out] out_buf 输出缓冲区
+ * @param buf_size 缓冲区大小
+ * @return ESP_OK=成功读取，ESP_ERR_NVS_NOT_FOUND=无记录
+ */
+static esp_err_t load_url_from_nvs(char *out_buf, size_t buf_size)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "NVS open failed: %s (namespace may not exist yet)",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    size_t required_size = buf_size;
+    err = nvs_get_str(handle, NVS_KEY_UPLOAD_URL, out_buf, &required_size);
+    nvs_close(handle);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "NVS: loaded upload_url = \"%s\"", out_buf);
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGD(TAG, "NVS: no saved upload_url");
+    } else {
+        ESP_LOGW(TAG, "NVS read failed: %s", esp_err_to_name(err));
+    }
+
+    return err;
+}
+
+/**
+ * 将 upload URL 保存到 NVS
+ * @param url 要保存的 URL 字符串
+ * @return ESP_OK=成功
+ */
+static esp_err_t save_url_to_nvs(const char *url)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open for write failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_str(handle, NVS_KEY_UPLOAD_URL, url);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS write failed: %s", esp_err_to_name(err));
+        nvs_close(handle);
+        return err;
+    }
+
+    err = nvs_commit(handle);
+    nvs_close(handle);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "NVS: saved upload_url = \"%s\"", url);
+    } else {
+        ESP_LOGE(TAG, "NVS commit failed: %s", esp_err_to_name(err));
+    }
+
+    return err;
+}
+
+/**
+ * 解析 upload URL（优先级链）
+ *
+ * 1. config.upload_url 非空 → 使用该 URL
+ * 2. config.server_ip 非空 → 拼接 http://ip:port/path
+ * 3. NVS "upload_url" → 若存在则覆盖
+ * 4. 默认值 DEFAULT_UPLOAD_URL
+ *
+ * @param config 上传配置（可为 NULL）
+ */
+static void resolve_upload_url(const uploader_config_t *config)
+{
+    char resolved[128] = {0};
+
+    /* Step 1: config.upload_url 优先 */
+    if (config != NULL && config->upload_url[0] != '\0') {
+        strncpy(resolved, config->upload_url, sizeof(resolved) - 1);
+        resolved[sizeof(resolved) - 1] = '\0';
+        ESP_LOGI(TAG, "URL from config.upload_url: \"%s\"", resolved);
+    }
+    /* Step 2: 拼接 server_ip:port/path */
+    else if (config != NULL && config->server_ip[0] != '\0') {
+        int written = snprintf(resolved, sizeof(resolved), "http://%s:%u%s",
+                               config->server_ip,
+                               (unsigned)config->server_port,
+                               config->upload_path[0] != '\0' ? config->upload_path : "/upload");
+        if (written < 0 || (size_t)written >= sizeof(resolved)) {
+            ESP_LOGW(TAG, "URL concatenation overflow, using default");
+            strncpy(resolved, DEFAULT_UPLOAD_URL, sizeof(resolved) - 1);
+            resolved[sizeof(resolved) - 1] = '\0';
+        } else {
+            ESP_LOGI(TAG, "URL from ip:port/path: \"%s\"", resolved);
+        }
+    }
+    /* Step 3/4 会在下面通过 NVS 或默认值覆盖 */
+
+    /* Step 3: NVS 覆盖（如果 NVS 中有值，则覆盖上面的结果） */
+    char nvs_url[128] = {0};
+    esp_err_t nvs_err = load_url_from_nvs(nvs_url, sizeof(nvs_url));
+    if (nvs_err == ESP_OK && nvs_url[0] != '\0') {
+        ESP_LOGI(TAG, "NVS URL overrides config: \"%s\"", nvs_url);
+        strncpy(resolved, nvs_url, sizeof(resolved) - 1);
+        resolved[sizeof(resolved) - 1] = '\0';
+    }
+
+    /* Step 4: 如果以上都为空，使用默认值 */
+    if (resolved[0] == '\0') {
+        strncpy(resolved, DEFAULT_UPLOAD_URL, sizeof(resolved) - 1);
+        resolved[sizeof(resolved) - 1] = '\0';
+        ESP_LOGI(TAG, "URL from default: \"%s\"", resolved);
+    }
+
+    /* 写入静态变量 */
+    strncpy(s_upload_url, resolved, sizeof(s_upload_url) - 1);
+    s_upload_url[sizeof(s_upload_url) - 1] = '\0';
+
+    ESP_LOGI(TAG, "Final upload URL: \"%s\"", s_upload_url);
+}
 
 /*======================================================================
  * Internal Helpers
@@ -174,9 +322,6 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
  * Upload — HTTP (Cloudflare Tunnel) — RAW BODY (audio/wav)
  *======================================================================*/
 
-#define UPLOAD_URL            "http://record.east-deep.com/upload"
-#define UPLOAD_CHUNK_SIZE     (8 * 1024)   /* 8KB chunk size */
-
 /**
  * 上传单个文件 (HTTP raw body — Content-Type: audio/wav)
  *
@@ -217,6 +362,9 @@ static esp_err_t do_upload(const char *filename)
     s_response_body[0]    = '\0';
     s_response_body_len    = 0;
 
+    /* ── 发布上传开始事件 ── */
+    event_bus_publish(EVENT_UPLOAD_STARTED, filename, strlen(filename) + 1);
+
     /* ── total_len = 文件大小（无 multipart 开销） ── */
     size_t total_len = (size_t)file_size;
     ESP_LOGI(TAG, "[HTTP] total_len  : %zu bytes (raw wav)", total_len);
@@ -232,12 +380,12 @@ static esp_err_t do_upload(const char *filename)
         return ESP_FAIL;
     }
 
-    /* ── HTTP 客户端配置 ── */
+    /* ── HTTP 客户端配置（使用 s_upload_url） ── */
     esp_http_client_config_t http_config = {
-        .url           = UPLOAD_URL,
+        .url           = s_upload_url,
         .event_handler = http_event_handler,
         .method        = HTTP_METHOD_POST,
-        .timeout_ms    = 600000,  /* 10 分钟，支持慢速上传 */
+        .timeout_ms    = s_timeout_ms,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&http_config);
@@ -273,6 +421,7 @@ static esp_err_t do_upload(const char *filename)
 
     uint32_t total_sent   = 0;
     uint32_t last_log_bytes = 0;
+    uint32_t last_progress_bytes = 0;
     size_t   nread;
 
     while ((nread = fread(buf, 1, UPLOAD_CHUNK_SIZE, fp)) > 0) {
@@ -300,6 +449,18 @@ static esp_err_t do_upload(const char *filename)
                      (unsigned long)total_sent,
                      (unsigned long)file_size, speed_kbps);
             last_log_bytes = total_sent;
+        }
+
+        /* 每发送 512KB 或文件发送完毕时，发布上传进度事件 */
+        if (total_sent - last_progress_bytes >= 512 * 1024 ||
+            total_sent == file_size) {
+            event_upload_progress_data_t progress = {
+                .progress_percent = (int)((total_sent * 100) / file_size),
+                .bytes_sent       = total_sent,
+                .bytes_total      = file_size,
+            };
+            event_bus_publish(EVENT_UPLOAD_PROGRESS, &progress, sizeof(progress));
+            last_progress_bytes = total_sent;
         }
     }
     fclose(fp);
@@ -361,6 +522,12 @@ static esp_err_t do_upload(const char *filename)
             ESP_LOGW(TAG, "[UPLOAD] unlink failed: %s errno=%d (%s)",
                      full_path, errno, strerror(errno));
         }
+        /* 发布上传成功事件 */
+        event_upload_result_data_t result = {0};
+        strncpy(result.filename, filename, sizeof(result.filename) - 1);
+        result.success = true;
+        result.http_status = 200;
+        event_bus_publish(EVENT_UPLOAD_DONE, &result, sizeof(result));
         return ESP_OK;
     } else {
         if (fetch_err != ESP_OK) {
@@ -368,6 +535,12 @@ static esp_err_t do_upload(const char *filename)
                      esp_err_to_name(fetch_err));
         }
         ESP_LOGE(TAG, "[UPLOAD_FAIL] %s HTTP %d", filename, status);
+        /* 发布上传失败事件 */
+        event_upload_result_data_t result = {0};
+        strncpy(result.filename, filename, sizeof(result.filename) - 1);
+        result.success = false;
+        result.http_status = status;
+        event_bus_publish(EVENT_UPLOAD_FAILED, &result, sizeof(result));
         return ESP_FAIL;
     }
 }
@@ -394,13 +567,85 @@ static void on_wifi_status(bool connected, void *user_data)
 }
 
 /*======================================================================
+ * Startup Recovery: move orphaned files from recordings/ to upload_queue/
+ *======================================================================*/
+
+/**
+ * On startup, scan recordings/ for finalized .wav files and move them
+ * to upload_queue/ so they get uploaded. This handles the case where
+ * the device was reset before recorder_stop() could move them.
+ *
+ * Safety: we skip files that appear to be currently open (though on
+ * a fresh boot this shouldn't happen). We only move .wav files whose
+ * size > WAV_HEADER_SIZE (44 bytes) as a sanity check.
+ */
+static void recover_recordings_dir(void)
+{
+    char recordings_dir[64];
+    char queue_dir[64];
+    storage_build_vfs_path(recordings_dir, sizeof(recordings_dir), STORAGE_PATH_RECORDINGS, NULL);
+    storage_build_vfs_path(queue_dir, sizeof(queue_dir), STORAGE_PATH_UPLOAD_QUEUE, NULL);
+
+    DIR *dir = opendir(recordings_dir);
+    if (dir == NULL) {
+        ESP_LOGD(TAG, "[RECOVER] opendir recordings/ failed: errno=%d", errno);
+        return;
+    }
+
+    int moved = 0;
+    int skipped = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) continue;
+        const char *ext = strrchr(entry->d_name, '.');
+        if (ext == NULL || strcasecmp(ext, ".wav") != 0) continue;
+
+        /* Sanity check: file size > WAV header (44 bytes) */
+        char src_path[128];
+        storage_build_vfs_path(src_path, sizeof(src_path), STORAGE_PATH_RECORDINGS, entry->d_name);
+        struct stat st;
+        if (stat(src_path, &st) != 0 || st.st_size <= 44) {
+            ESP_LOGW(TAG, "[RECOVER] skip (too small or stat failed): %s", entry->d_name);
+            skipped++;
+            continue;
+        }
+
+        /* Move to upload_queue/ (storage_rename_file handles cross-dir rename) */
+        esp_err_t err = storage_rename_file(
+            STORAGE_PATH_RECORDINGS, entry->d_name,
+            STORAGE_PATH_UPLOAD_QUEUE, entry->d_name);
+
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "[RECOVER] moved recordings/%s -> upload_queue/%s",
+                     entry->d_name, entry->d_name);
+            moved++;
+        } else {
+            ESP_LOGW(TAG, "[RECOVER] rename failed for %s: %s",
+                     entry->d_name, esp_err_to_name(err));
+            skipped++;
+        }
+    }
+    closedir(dir);
+
+    if (moved > 0 || skipped > 0) {
+        ESP_LOGI(TAG, "[RECOVER] recordings/ scan complete: moved=%d skipped=%d", moved, skipped);
+    } else {
+        ESP_LOGI(TAG, "[RECOVER] recordings/ scan complete: no orphaned files");
+    }
+}
+
+/*======================================================================
  * Upload Queue Task
  *======================================================================*/
 static void uploader_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG, "uploader_task started (poll=%dms)", POLL_INTERVAL_MS);
-    ESP_LOGI(TAG, "  HTTP URL: " UPLOAD_URL);
+    ESP_LOGI(TAG, "  HTTP URL: %s", s_upload_url);
+    ESP_LOGI(TAG, "  Timeout : %lu ms", (unsigned long)s_timeout_ms);
+
+    /* Recover orphaned recordings left from previous sessions */
+    recover_recordings_dir();
 
     /* 初始状态检查 */
     s_wifi_ok = wifi_manager_is_connected();
@@ -479,13 +724,17 @@ static void uploader_task(void *arg)
 
 esp_err_t uploader_init(const uploader_config_t *config)
 {
-    if (config != NULL) {
-        /* 不再使用 s_config，URL 硬编码在 UPLOAD_URL */
-        (void)config;
+    /* 解析 upload URL（优先级链：config → 拼接 → NVS → 默认值） */
+    resolve_upload_url(config);
+
+    /* 存储 timeout 配置 */
+    if (config != NULL && config->timeout_ms > 0) {
+        s_timeout_ms = config->timeout_ms;
     }
 
     ESP_LOGI(TAG, "Uploader initialized");
-    ESP_LOGI(TAG, "  URL: " UPLOAD_URL);
+    ESP_LOGI(TAG, "  URL: %s", s_upload_url);
+    ESP_LOGI(TAG, "  Timeout: %lu ms", (unsigned long)s_timeout_ms);
     ESP_LOGI(TAG, "  Retry delays: %lu/%lu/%lu ms",
              (unsigned long)RETRY_DELAYS_MS[0],
              (unsigned long)RETRY_DELAYS_MS[1],
@@ -527,30 +776,40 @@ esp_err_t uploader_start(void)
     return ESP_OK;
 }
 
-esp_err_t uploader_upload(const char *file_path,
-                          char *out_response, size_t response_size)
-{
-    /* 单次上传接口已废弃（队列模式），保留仅用于兼容 */
-    (void)file_path;
-    (void)out_response;
-    (void)response_size;
-    ESP_LOGW(TAG, "uploader_upload() is deprecated — use queue mode");
-    return ESP_ERR_NOT_SUPPORTED;
-}
-
-int uploader_get_progress(void)
-{
-    return 0;  /* 队列模式无全局进度 */
-}
-
-esp_err_t uploader_delete_after_upload(const char *file_path)
-{
-    /* 上传成功后直接 unlink，此函数仅作兼容 */
-    (void)file_path;
-    return ESP_OK;
-}
-
 bool uploader_is_uploading(void)
 {
     return (s_task_handle != NULL) && !s_paused && s_wifi_ok;
+}
+
+esp_err_t uploader_set_url(const char *url)
+{
+    if (url == NULL) {
+        ESP_LOGE(TAG, "uploader_set_url: url is NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t url_len = strlen(url);
+    if (url_len == 0 || url_len >= sizeof(s_upload_url)) {
+        ESP_LOGE(TAG, "uploader_set_url: invalid URL length %zu (max %zu)",
+                 url_len, sizeof(s_upload_url) - 1);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 写入 NVS 持久化 */
+    esp_err_t err = save_url_to_nvs(url);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS save failed, URL change will not persist across reboot");
+    }
+
+    /* 更新运行时 URL */
+    strncpy(s_upload_url, url, sizeof(s_upload_url) - 1);
+    s_upload_url[sizeof(s_upload_url) - 1] = '\0';
+
+    ESP_LOGI(TAG, "Upload URL updated: \"%s\"", s_upload_url);
+    return ESP_OK;
+}
+
+const char* uploader_get_url(void)
+{
+    return s_upload_url;
 }

@@ -1,0 +1,26 @@
+sequenceDiagram
+    participant ESP32
+    participant upload_router
+    participant database
+    participant transcriber
+    participant mlx_whisper
+    participant transcripts_router
+
+    ESP32->>upload_router: POST /upload (audio/wav, RAW BODY)
+    upload_router->>upload_router: 流式读取 body → 写入 received/
+    upload_router->>database: INSERT INTO files (filename, saved_name, file_size, upload_time, upload_src)
+    upload_router->>database: INSERT INTO transcriptions (file_id, status='pending')
+    upload_router->>transcriber: enqueue(file_id)
+    upload_router-->>ESP32: {code:0, message:"success", data:{file_id, filename, size}}
+
+    Note over transcriber: 异步后台 worker
+    transcriber->>database: UPDATE transcriptions SET status='processing'
+    transcriber->>mlx_whisper: 调用 mlx_whisper.transcribe(path)
+    mlx_whisper-->>transcriber: {text, language, duration}
+    transcriber->>database: UPDATE transcriptions SET status='completed', text=..., language=..., duration=...
+    transcriber->>transcriber: 写 .txt 到 transcripts/
+
+    Note over transcripts_router: 查询转写结果
+    transcripts_router->>database: SELECT * FROM transcriptions WHERE file_id=?
+    database-->>transcripts_router: 转写记录
+    transcripts_router-->>ESP32: {code:0, data:{status:'completed', text:'...'}}

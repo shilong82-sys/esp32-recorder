@@ -4,5 +4,5 @@
 idf_component_register(
     SRCS "uploader.c"
     INCLUDE_DIRS "include"
-    REQUIRES esp_wifi esp_http_client nvs_flash storage recorder wifi_manager
+    REQUIRES esp_wifi esp_http_client nvs_flash storage recorder wifi_manager event_bus
 )

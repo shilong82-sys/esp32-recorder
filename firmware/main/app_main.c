@@ -306,7 +306,8 @@ void app_main(void)
     /* 12. Uploader (独立任务，队列模式) */
     ESP_LOGI(TAG, "[12/12] Uploader (queue mode) ...");
     uploader_config_t up_cfg = {
-        .server_ip   = "192.168.1.39",
+        .upload_url  = "",            /* 空字符串：使用 NVS 或默认 URL */
+        .server_ip   = "192.168.1.205",
         .server_port = 8000,
         .upload_path = "/upload",
         .timeout_ms  = 30000,

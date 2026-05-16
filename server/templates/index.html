@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 AI Recorder — 管理面板</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="app-header">
+    <h1>🎙️ ESP32 AI Recorder <span class="subtitle">— 管理面板</span></h1>
+  </header>
+
+  <main class="app-main">
+    <!-- Tab 导航 -->
+    <nav class="tab-nav">
+      <button class="tab-btn active" data-tab="files">录音列表</button>
+      <button class="tab-btn" data-tab="transcripts">转写记录</button>
+      <button class="tab-btn" data-tab="status">系统状态</button>
+    </nav>
+
+    <!-- ====== 录音列表 Tab ====== -->
+    <section id="tab-files" class="tab-panel active">
+      <div class="panel-header">
+        <h2>录音列表</h2>
+        <button id="btn-refresh-files" class="btn btn-secondary" title="刷新列表">🔄 刷新</button>
+      </div>
+
+      <div class="table-wrap">
+        <table id="files-table" class="data-table">
+          <thead>
+            <tr>
+              <th>文件名</th>
+              <th>大小</th>
+              <th>上传时间</th>
+              <th>转写状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="files-tbody">
+            <tr><td colspan="5" class="empty-msg">加载中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="pagination" id="files-pagination"></div>
+
+      <!-- 转写结果详情面板 -->
+      <div id="file-detail-panel" class="detail-panel hidden">
+        <div class="detail-header">
+          <h3 id="detail-filename"></h3>
+          <span id="detail-meta" class="detail-meta"></span>
+          <button class="btn-close" id="btn-close-detail" title="关闭">✕</button>
+        </div>
+        <div id="detail-content" class="detail-content">
+          <p class="empty-msg">点击上方录音行查看转写结果</p>
+        </div>
+        <div id="detail-actions" class="detail-actions hidden">
+          <button id="btn-download-txt" class="btn btn-secondary">📥 下载 .txt</button>
+          <button id="btn-copy-txt" class="btn btn-secondary">📋 复制</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ====== 转写记录 Tab ====== -->
+    <section id="tab-transcripts" class="tab-panel">
+      <div class="panel-header">
+        <h2>转写记录</h2>
+        <div class="filter-group">
+          <select id="transcript-status-filter" class="select-filter">
+            <option value="">全部</option>
+            <option value="completed">已完成</option>
+            <option value="failed">失败</option>
+            <option value="processing">处理中</option>
+            <option value="pending">等待中</option>
+          </select>
+          <button id="btn-refresh-transcripts" class="btn btn-secondary" title="刷新列表">🔄 刷新</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table id="transcripts-table" class="data-table">
+          <thead>
+            <tr>
+              <th>文件 ID</th>
+              <th>状态</th>
+              <th>语言</th>
+              <th>时长</th>
+              <th>完成时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="transcripts-tbody">
+            <tr><td colspan="6" class="empty-msg">加载中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="pagination" id="transcripts-pagination"></div>
+
+      <!-- 转写详情面板 -->
+      <div id="transcript-detail-panel" class="detail-panel hidden">
+        <div class="detail-header">
+          <h3 id="transcript-detail-title"></h3>
+          <button class="btn-close" id="btn-close-transcript-detail" title="关闭">✕</button>
+        </div>
+        <div id="transcript-detail-content" class="detail-content">
+          <p class="empty-msg">点击记录查看详情</p>
+        </div>
+        <div id="transcript-detail-actions" class="detail-actions hidden">
+          <button id="btn-download-transcript-txt" class="btn btn-secondary">📥 下载 .txt</button>
+          <button id="btn-copy-transcript-txt" class="btn btn-secondary">📋 复制</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ====== 系统状态 Tab ====== -->
+    <section id="tab-status" class="tab-panel">
+      <div class="panel-header">
+        <h2>系统状态</h2>
+        <button id="btn-refresh-status" class="btn btn-secondary" title="刷新">🔄 刷新</button>
+      </div>
+
+      <div class="status-grid">
+        <div class="status-card">
+          <div class="status-label">磁盘使用</div>
+          <div class="status-value" id="stat-disk">—</div>
+          <div class="progress-bar">
+            <div class="progress-fill" id="stat-disk-bar" style="width: 0%"></div>
+          </div>
+        </div>
+        <div class="status-card">
+          <div class="status-label">文件数</div>
+          <div class="status-value" id="stat-files">—</div>
+        </div>
+        <div class="status-card">
+          <div class="status-label">转写统计</div>
+          <div class="status-value" id="stat-transcripts">—</div>
+          <div class="status-sub" id="stat-transcripts-detail"></div>
+        </div>
+        <div class="status-card">
+          <div class="status-label">mlx-whisper</div>
+          <div class="status-value" id="stat-whisper">—</div>
+        </div>
+        <div class="status-card">
+          <div class="status-label">服务运行时间</div>
+          <div class="status-value" id="stat-uptime">—</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    ESP32 AI Recorder v0.3.0 &nbsp;|&nbsp; <a href="/docs" target="_blank">API 文档</a>
+  </footer>
+
+  <!-- 删除确认对话框 -->
+  <div id="delete-dialog" class="dialog-overlay hidden">
+    <div class="dialog-box">
+      <p>确定要删除 <strong id="delete-filename"></strong> 吗？<br>此操作不可撤销，文件和转写记录将被永久删除。</p>
+      <div class="dialog-actions">
+        <button id="btn-delete-cancel" class="btn btn-secondary">取消</button>
+        <button id="btn-delete-confirm" class="btn btn-danger">确认删除</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast 通知 -->
+  <div id="toast-container"></div>
+
+  <script>
+    // 传递服务器启动时间给前端用于计算运行时长
+    window.SERVER_START_TIME = "{{ server_start_time }}";
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

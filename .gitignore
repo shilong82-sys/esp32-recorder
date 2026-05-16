@@ -40,6 +40,7 @@ env/
 
 # ESP-IDF build artifacts
 build/
+sdkconfig
 sdkconfig.old
 sdkconfig.defaults
 
@@ -62,6 +63,17 @@ recordings/
 uploads/
 transcripts/
 archive/
+
+# FastAPI server runtime data
+server/received/
+server/transcripts/
+server/recorder.db
+server/recorder.db-shm
+server/recorder.db-wal
+
+# Old Flask server (kept for reference but not tracked)
+upload_server.py
+firmware/server/
 
 # OS generated files
 .DS_Store

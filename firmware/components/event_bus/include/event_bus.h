@@ -9,7 +9,9 @@
 #ifndef EVENT_BUS_H
 #define EVENT_BUS_H
 
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,8 +91,19 @@ typedef struct {
  * @brief 上传进度事件数据
  */
 typedef struct {
-    int progress_percent;
+    int progress_percent;       /*!< 进度百分比 (0~100) */
+    uint32_t bytes_sent;        /*!< 已发送字节数 */
+    uint32_t bytes_total;       /*!< 文件总字节数 */
 } event_upload_progress_data_t;
+
+/**
+ * @brief 上传结果事件数据（EVENT_UPLOAD_DONE / EVENT_UPLOAD_FAILED 使用）
+ */
+typedef struct {
+    char filename[64];          /*!< 上传文件名（不含路径） */
+    bool success;               /*!< true=上传成功, false=上传失败 */
+    int http_status;            /*!< HTTP 状态码（200=成功，其余=失败） */
+} event_upload_result_data_t;
 
 /* ---- APIs ---- */
 

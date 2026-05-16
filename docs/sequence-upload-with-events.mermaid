@@ -1,0 +1,33 @@
+sequenceDiagram
+    participant uploader_task
+    participant do_upload
+    participant esp_http_client
+    participant event_bus
+    participant SD卡
+
+    uploader_task->>uploader_task: get_next_file()
+    uploader_task->>do_upload: do_upload(filename)
+    do_upload->>SD卡: stat(full_path) — 获取文件大小
+    do_upload->>event_bus: publish(EVENT_UPLOAD_STARTED, filename)
+    do_upload->>esp_http_client: esp_http_client_open()
+    
+    loop 每 8KB chunk
+        do_upload->>SD卡: fread(buf)
+        do_upload->>esp_http_client: esp_http_client_write(buf)
+        Note over do_upload: 每 512KB 发布一次进度
+        opt total_sent % 512KB == 0
+            do_upload->>event_bus: publish(EVENT_UPLOAD_PROGRESS, {bytes_sent, bytes_total})
+        end
+    end
+    
+    do_upload->>esp_http_client: fetch_headers()
+    esp_http_client-->>do_upload: HTTP status
+    
+    alt HTTP 200
+        do_upload->>SD卡: unlink(full_path)
+        do_upload->>event_bus: publish(EVENT_UPLOAD_DONE, {filename, success=true})
+    else 非 200
+        do_upload->>event_bus: publish(EVENT_UPLOAD_FAILED, {filename, success=false, http_status})
+    end
+    
+    do_upload-->>uploader_task: ESP_OK / ESP_FAIL
