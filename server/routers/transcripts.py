@@ -4,9 +4,12 @@ GET  /api/transcripts                — 转写列表
 GET  /api/transcripts/{file_id}      — 转写详情（含文本）
 GET  /api/transcripts/{file_id}/export — 导出 .txt
 POST /api/transcribe/{file_id}       — 手动触发转写
+PUT  /api/transcripts/{file_id}      — 编辑转写文本
 """
 
 import logging
+import os
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -21,6 +24,7 @@ from ..models import File, Transcription
 from ..schemas import (
     ApiResponse,
     ErrorCode,
+    TranscriptEditRequest,
     TranscriptItem,
     TranscriptListData,
     TranscriptListItem,
@@ -45,6 +49,8 @@ def _transcription_to_list_item(t: Transcription) -> TranscriptListItem:
         model=t.model,
         language=t.language,
         duration=t.duration,
+        is_edited=t.is_edited,
+        edited_at=t.edited_at,
         error_msg=t.error_msg,
         started_at=t.started_at,
         completed_at=t.completed_at,
@@ -62,6 +68,8 @@ def _transcription_to_detail(t: Transcription) -> TranscriptItem:
         model=t.model,
         language=t.language,
         duration=t.duration,
+        is_edited=t.is_edited,
+        edited_at=t.edited_at,
         error_msg=t.error_msg,
         started_at=t.started_at,
         completed_at=t.completed_at,
@@ -211,6 +219,9 @@ async def trigger_transcribe(
         db_transcript.error_msg = None
         db_transcript.started_at = None
         db_transcript.completed_at = None
+        # 重置编辑标记
+        db_transcript.is_edited = 0
+        db_transcript.edited_at = None
         logger.info(
             "Reset transcription %d for file_id=%d (was %s)",
             db_transcript.id, file_id, old_status,
@@ -233,3 +244,65 @@ async def trigger_transcribe(
             "status": db_transcript.status,
         },
     )
+
+
+@router.put("/transcripts/{file_id}", response_model=ApiResponse)
+async def edit_transcript(
+    file_id: int,
+    request: TranscriptEditRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse:
+    """编辑转写文本。
+
+    更新 text 字段，设置 is_edited=1 和 edited_at 为当前时间。
+
+    Args:
+        file_id: 文件 ID。
+        request: 编辑请求体（含新文本）。
+        session: 数据库会话。
+
+    Returns:
+        更新后的转写详情。
+    """
+    query = select(Transcription).where(Transcription.file_id == file_id)
+    result = await session.execute(query)
+    db_transcript = result.scalar_one_or_none()
+
+    if db_transcript is None:
+        return ApiResponse(
+            code=ErrorCode.TRANSCRIPTION_NOT_FOUND,
+            message="Transcription not found for this file",
+            data=None,
+        )
+
+    if db_transcript.status != "completed":
+        return ApiResponse(
+            code=ErrorCode.BAD_REQUEST,
+            message="Can only edit completed transcriptions",
+            data=None,
+        )
+
+    # 更新文本和编辑标记
+    db_transcript.text = request.text
+    db_transcript.is_edited = 1
+    db_transcript.edited_at = datetime.now(timezone.utc)
+
+    # 同步写入文本文件
+    config = get_config()
+    txt_filename = os.path.splitext(
+        (await session.execute(
+            select(File.saved_name).where(File.id == file_id)
+        )).scalar_one_or_none() or f"file_{file_id}"
+    )[0] + ".txt"
+    txt_path = os.path.join(config.transcripts_dir, txt_filename)
+
+    try:
+        os.makedirs(config.transcripts_dir, exist_ok=True)
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(request.text)
+    except OSError as exc:
+        logger.warning("Failed to update transcript file %s: %s", txt_path, exc)
+
+    logger.info("Transcript edited: file_id=%d", file_id)
+
+    return ApiResponse(data=_transcription_to_detail(db_transcript).model_dump())

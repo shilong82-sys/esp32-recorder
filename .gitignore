@@ -64,12 +64,19 @@ uploads/
 transcripts/
 archive/
 
+# Environment & secrets
+.env
+.env.*
+
 # FastAPI server runtime data
 server/received/
 server/transcripts/
 server/recorder.db
 server/recorder.db-shm
 server/recorder.db-wal
+server/database.db
+server/database.db-shm
+server/database.db-wal
 
 # Old Flask server (kept for reference but not tracked)
 upload_server.py

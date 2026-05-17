@@ -6,6 +6,7 @@ asyncio.Queue + 单 worker 后台转写，支持：
 - 超时 10 分钟，失败重试 1 次（间隔 30 秒）
 - 转写结果写文件 transcripts/{saved_name}.txt
 - 启动时自动处理 pending 记录 + 修复 stuck processing
+- 从 settings 表读取语言和模型配置
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from sqlalchemy import select, update
 
 from ..config import get_config
 from ..models import File, Transcription
+from ..services.settings_service import get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -200,25 +202,36 @@ class Transcriber:
                 )
                 return
 
+            # 从 settings 表读取语言和模型配置
+            language = await get_setting("transcribe_language", "zh")
+            model = await get_setting("transcribe_model", config.whisper_model)
+
             # 更新状态为 processing
             db_trans.status = "processing"
             db_trans.started_at = datetime.now(timezone.utc)
-            db_trans.model = config.whisper_model
+            db_trans.model = model
             await session.commit()
 
         # ---- 执行转写 ----
         audio_path = os.path.join(config.received_dir, saved_name)
 
+        # 将 "auto" 语言转换为 None（mlx-whisper 自动检测）
+        whisper_language: Optional[str] = None
+        if language and language != "auto":
+            whisper_language = language
+
         try:
             # 使用 asyncio.wait_for 实现超时，asyncio.to_thread 避免阻塞事件循环
             result: dict[str, Any] = await asyncio.wait_for(
-                asyncio.to_thread(self._transcribe_audio, audio_path, config.whisper_model),
+                asyncio.to_thread(
+                    self._transcribe_audio, audio_path, model, whisper_language
+                ),
                 timeout=config.transcribe_timeout_s,
             )
 
             # ---- 转写成功 ----
             text = result.get("text", "")
-            language = result.get("language")
+            detected_language = result.get("language")
             duration = result.get("duration")
 
             async with _async_session_factory() as session:
@@ -229,7 +242,8 @@ class Transcriber:
                 if db_trans is not None:
                     db_trans.status = "completed"
                     db_trans.text = text
-                    db_trans.language = language
+                    # 写入实际使用的语言：如果指定了语言则用指定的，否则用检测到的
+                    db_trans.language = whisper_language or detected_language
                     db_trans.duration = duration
                     db_trans.completed_at = datetime.now(timezone.utc)
                     await session.commit()
@@ -239,7 +253,7 @@ class Transcriber:
 
             logger.info(
                 "Transcription completed: file_id=%d lang=%s duration=%.1fs",
-                file_id, language, duration or 0,
+                file_id, whisper_language or detected_language, duration or 0,
             )
 
         except asyncio.TimeoutError:
@@ -313,19 +327,28 @@ class Transcriber:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _transcribe_audio(audio_path: str, model: str) -> dict[str, Any]:
+    def _transcribe_audio(
+        audio_path: str, model: str, language: Optional[str] = None
+    ) -> dict[str, Any]:
         """调用 mlx-whisper 进行转写（同步函数，在子线程中执行）。
 
         Args:
             audio_path: 音频文件路径。
             model: 模型名称或 HuggingFace repo ID。
+            language: 转写语言，None 时由 mlx-whisper 自动检测。
 
         Returns:
             转写结果字典，包含 text, language, duration 等字段。
         """
         import mlx_whisper
 
-        result = mlx_whisper.transcribe(audio_path, path_or_hf_repo=model)
+        kwargs: dict[str, Any] = {
+            "path_or_hf_repo": model,
+        }
+        if language is not None:
+            kwargs["language"] = language
+
+        result = mlx_whisper.transcribe(audio_path, **kwargs)
         return result
 
     # ------------------------------------------------------------------

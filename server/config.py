@@ -43,6 +43,19 @@ class AppConfig:
         default_factory=lambda: int(os.getenv("RECORDER_TRANSCRIBE_TIMEOUT_S", "600"))
     )
 
+    auth_password: str = field(
+        default_factory=lambda: os.getenv("RECORDER_AUTH_PASSWORD", "changeme")
+    )
+    auth_enabled: bool = field(
+        default_factory=lambda: os.getenv("RECORDER_AUTH_ENABLED", "true").lower()
+        not in ("false", "0", "no", "off")
+    )
+    session_secret: str = field(
+        default_factory=lambda: os.getenv(
+            "RECORDER_SESSION_SECRET", "esp32-recorder-secret-key"
+        )
+    )
+
     def __post_init__(self) -> None:
         """补全依赖 base_dir 的默认路径。"""
         base_dir = os.path.dirname(os.path.abspath(__file__))

@@ -3,7 +3,8 @@
 GET    /api/files              — 文件列表（分页+排序+过滤）
 GET    /api/files/{file_id}    — 文件详情
 DELETE /api/files/{file_id}    — 删除文件及关联转写
-GET    /api/files/{file_id}/download — 下载 WAV 文件
+GET    /api/files/{file_id}/download  — 下载 WAV 文件
+GET    /api/files/{file_id}/stream   — 流式播放 WAV（支持 HTTP Range 请求）
 """
 
 import logging
@@ -11,8 +12,8 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -32,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
 
+# Range 请求的默认块大小（1 MB）
+CHUNK_SIZE = 1024 * 1024
+
 
 # ---------------------------------------------------------------------------
 # 辅助函数
@@ -49,6 +53,8 @@ def _file_to_item(db_file: File) -> FileListItem:
             "model": t.model,
             "language": t.language,
             "duration": t.duration,
+            "is_edited": t.is_edited,
+            "edited_at": t.edited_at,
             "error_msg": t.error_msg,
             "started_at": t.started_at,
             "completed_at": t.completed_at,
@@ -61,6 +67,7 @@ def _file_to_item(db_file: File) -> FileListItem:
         file_size=db_file.file_size,
         upload_time=db_file.upload_time,
         upload_src=db_file.upload_src,
+        duration=db_file.duration,
         created_at=db_file.created_at,
         transcription=transcription,
     )
@@ -79,6 +86,8 @@ def _file_to_detail(db_file: File) -> FileItem:
             "model": t.model,
             "language": t.language,
             "duration": t.duration,
+            "is_edited": t.is_edited,
+            "edited_at": t.edited_at,
             "error_msg": t.error_msg,
             "started_at": t.started_at,
             "completed_at": t.completed_at,
@@ -91,9 +100,59 @@ def _file_to_detail(db_file: File) -> FileItem:
         file_size=db_file.file_size,
         upload_time=db_file.upload_time,
         upload_src=db_file.upload_src,
+        duration=db_file.duration,
         created_at=db_file.created_at,
         transcription=transcription,
     )
+
+
+def _parse_range(range_header: str, file_size: int) -> tuple[int, int]:
+    """解析 HTTP Range 头。
+
+    Args:
+        range_header: Range 头值，如 "bytes=0-1023" 或 "bytes=0-"。
+        file_size: 文件总大小。
+
+    Returns:
+        (start, end) 元组，end 为包含的结束位置。
+    """
+    # 格式: bytes=start-end 或 bytes=start-
+    range_spec = range_header.replace("bytes=", "")
+    parts = range_spec.split("-", 1)
+
+    try:
+        start = int(parts[0]) if parts[0] else 0
+        end = int(parts[1]) if parts[1] else file_size - 1
+    except (ValueError, IndexError):
+        start = 0
+        end = file_size - 1
+
+    # 边界检查
+    start = max(0, min(start, file_size - 1))
+    end = max(start, min(end, file_size - 1))
+
+    return start, end
+
+
+def _file_chunk_iterator(file_path: str, start: int, end: int, chunk_size: int):
+    """生成文件块的迭代器（用于 StreamingResponse）。
+
+    Args:
+        file_path: 文件路径。
+        start: 起始字节位置。
+        end: 结束字节位置（包含）。
+        chunk_size: 每次读取的块大小。
+    """
+    with open(file_path, "rb") as f:
+        f.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            read_size = min(chunk_size, remaining)
+            data = f.read(read_size)
+            if not data:
+                break
+            remaining -= len(data)
+            yield data
 
 
 # ---------------------------------------------------------------------------
@@ -290,3 +349,64 @@ async def download_file(
         media_type="audio/wav",
         filename=db_file.filename,
     )
+
+
+@router.get("/files/{file_id}/stream")
+async def stream_file(
+    file_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> StreamingResponse:
+    """流式返回 WAV 文件，支持 HTTP Range 请求。
+
+    用于浏览器 <audio> 标签内嵌播放。
+    """
+    config = get_config()
+
+    query = select(File).where(File.id == file_id)
+    result = await session.execute(query)
+    db_file = result.scalar_one_or_none()
+
+    if db_file is None:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_path = os.path.join(config.received_dir, db_file.saved_name)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    file_size = os.path.getsize(file_path)
+
+    # 解析 Range 头
+    range_header = request.headers.get("range")
+
+    if range_header:
+        start, end = _parse_range(range_header, file_size)
+        content_length = end - start + 1
+
+        headers = {
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+            "Content-Type": "audio/wav",
+        }
+
+        return StreamingResponse(
+            _file_chunk_iterator(file_path, start, end, CHUNK_SIZE),
+            status_code=206,
+            headers=headers,
+            media_type="audio/wav",
+        )
+    else:
+        # 无 Range 头，返回完整文件
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+            "Content-Type": "audio/wav",
+        }
+
+        return StreamingResponse(
+            _file_chunk_iterator(file_path, 0, file_size - 1, CHUNK_SIZE),
+            status_code=200,
+            headers=headers,
+            media_type="audio/wav",
+        )

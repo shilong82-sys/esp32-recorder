@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from ..config import get_config
 from ..models import File, Transcription
+from ..services.wav_utils import read_wav_duration
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,9 @@ async def index_received_dir() -> int:
             except OSError:
                 upload_time = datetime.now(timezone.utc)
 
+            # 从 WAV header 读取时长
+            duration = read_wav_duration(file_path)
+
             # 创建文件记录
             db_file = File(
                 filename=filename,
@@ -84,6 +88,7 @@ async def index_received_dir() -> int:
                 file_size=file_size,
                 upload_time=upload_time,
                 upload_src="indexed",
+                duration=duration,
             )
             session.add(db_file)
             await session.flush()
@@ -96,7 +101,12 @@ async def index_received_dir() -> int:
             session.add(db_transcription)
 
             indexed_count += 1
-            logger.info("Indexed: %s (%d bytes, id=%d)", filename, file_size, db_file.id)
+            logger.info(
+                "Indexed: %s (%d bytes, duration=%s, id=%d)",
+                filename, file_size,
+                f"{duration:.1f}s" if duration else "unknown",
+                db_file.id,
+            )
 
         await session.commit()
 

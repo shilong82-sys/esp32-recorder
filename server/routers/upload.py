@@ -14,7 +14,9 @@ from ..config import get_config
 from ..database import get_session
 from ..models import File, Transcription
 from ..schemas import ApiResponse, ErrorCode, UploadResponseData
+from ..services.settings_service import get_setting
 from ..services.transcriber import enqueue
+from ..services.wav_utils import read_wav_duration
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +133,11 @@ async def handle_upload(
     if request.client is not None:
         client_ip = request.client.host
 
+    # 从 WAV header 读取音频时长
+    duration = read_wav_duration(file_path)
+    if duration is not None:
+        logger.info("WAV duration: %.1fs for %s", duration, saved_name)
+
     # 创建数据库记录
     upload_time = datetime.now(timezone.utc)
     db_file = File(
@@ -139,6 +146,7 @@ async def handle_upload(
         file_size=file_size,
         upload_time=upload_time,
         upload_src=client_ip,
+        duration=duration,
     )
     session.add(db_file)
     await session.flush()  # 获取 db_file.id
@@ -151,12 +159,19 @@ async def handle_upload(
     session.add(db_transcription)
     await session.flush()
 
-    # 触发转写入队（占位实现，T03 才有实际 worker）
-    await enqueue(db_file.id)
+    # 读取 auto_transcribe 设置，判断是否自动入队转写
+    auto_transcribe = await get_setting("auto_transcribe", "true")
+    if auto_transcribe.lower() != "false":
+        await enqueue(db_file.id)
+        logger.info("Auto-transcribe enabled, enqueued file_id=%d", db_file.id)
+    else:
+        logger.info("Auto-transcribe disabled, skipping enqueue for file_id=%d", db_file.id)
 
     logger.info(
-        "File received: %s (%d bytes, src=%s) -> id=%d",
-        saved_name, file_size, client_ip, db_file.id,
+        "File received: %s (%d bytes, src=%s, duration=%ss) -> id=%d",
+        saved_name, file_size, client_ip,
+        f"{duration:.1f}" if duration else "unknown",
+        db_file.id,
     )
 
     return ApiResponse(

@@ -43,6 +43,8 @@ class TranscriptItem(BaseModel):
     model: Optional[str] = None
     language: Optional[str] = None
     duration: Optional[float] = None
+    is_edited: int = 0
+    edited_at: Optional[datetime] = None
     error_msg: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -60,6 +62,8 @@ class TranscriptListItem(BaseModel):
     model: Optional[str] = None
     language: Optional[str] = None
     duration: Optional[float] = None
+    is_edited: int = 0
+    edited_at: Optional[datetime] = None
     error_msg: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -73,6 +77,12 @@ class TranscriptListData(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class TranscriptEditRequest(BaseModel):
+    """转写编辑请求体。"""
+
+    text: str
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +100,7 @@ class FileItem(BaseModel):
     file_size: int
     upload_time: datetime
     upload_src: str
+    duration: Optional[float] = None
     created_at: datetime
     transcription: Optional[TranscriptItem] = None
 
@@ -105,6 +116,7 @@ class FileListItem(BaseModel):
     file_size: int
     upload_time: datetime
     upload_src: str
+    duration: Optional[float] = None
     created_at: datetime
     transcription: Optional[TranscriptListItem] = None
 
@@ -125,6 +137,30 @@ class UploadResponseData(BaseModel):
     filename: str
     saved_name: str
     file_size: int
+
+
+# ---------------------------------------------------------------------------
+# 搜索相关
+# ---------------------------------------------------------------------------
+
+class SearchResultItem(BaseModel):
+    """搜索结果条目。"""
+
+    file_id: int
+    filename: str
+    upload_time: Optional[str] = None
+    duration: Optional[float] = None
+    snippet: str
+
+
+# ---------------------------------------------------------------------------
+# 认证相关
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    """登录请求体。"""
+
+    password: str
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +196,8 @@ class ErrorCode:
 
     SUCCESS = 0
     BAD_REQUEST = 40000
+    UNAUTHORIZED = 40100
+    FORBIDDEN = 40300
     NOT_FOUND = 40400
     CONFLICT = 40900
     INTERNAL_ERROR = 50000

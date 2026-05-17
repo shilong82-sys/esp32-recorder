@@ -17,8 +17,10 @@ from fastapi.templating import Jinja2Templates
 
 from .config import get_config
 from .database import close_db, init_db
-from .routers import files, status, transcripts, upload
+from .middleware.auth import AuthMiddleware
+from .routers import auth, files, search, settings, status, transcripts, upload
 from .services.file_indexer import index_received_dir
+from .services.settings_service import init_default_settings
 from .services.transcriber import get_transcriber
 
 # 配置日志
@@ -44,7 +46,8 @@ async def lifespan(app: FastAPI):
     1. 初始化数据库
     2. 确保存储目录存在
     3. 索引 received/ 目录
-    4. 启动转写 worker
+    4. 初始化默认设置
+    5. 启动转写 worker
     """
     global _server_start_time
     config = get_config()
@@ -56,6 +59,10 @@ async def lifespan(app: FastAPI):
     # 初始化数据库
     await init_db()
     logger.info("Database initialized")
+
+    # 初始化默认设置（幂等）
+    await init_default_settings()
+    logger.info("Default settings initialized")
 
     # 索引 received/ 目录中已有的文件
     indexed = await index_received_dir()
@@ -90,7 +97,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="ESP32 AI Recorder",
         description="录音管理 + AI 转写平台",
-        version="0.3.0",
+        version="0.4.0",
         lifespan=lifespan,
     )
 
@@ -99,6 +106,9 @@ def create_app() -> FastAPI:
     app.include_router(files.router, tags=["files"])
     app.include_router(transcripts.router, tags=["transcripts"])
     app.include_router(status.router, tags=["status"])
+    app.include_router(auth.router, tags=["auth"])
+    app.include_router(settings.router, tags=["settings"])
+    app.include_router(search.router, tags=["search"])
 
     # 挂载静态文件（CSS、JS 等）
     static_dir = BASE_DIR / "static"
@@ -119,6 +129,9 @@ def create_app() -> FastAPI:
                 "server_start_time": _server_start_time,
             },
         )
+
+    # 注册认证中间件（放在路由注册后、返回 app 前）
+    app.add_middleware(AuthMiddleware)
 
     return app
 

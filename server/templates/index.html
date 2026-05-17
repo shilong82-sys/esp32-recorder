@@ -7,8 +7,25 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+  <!-- 登录遮罩 -->
+  <div id="login-overlay" class="login-overlay">
+    <div class="login-card">
+      <h2>🎙️ ESP32 AI Recorder</h2>
+      <p class="login-subtitle">请输入密码登录</p>
+      <input type="password" id="login-password" class="login-input" placeholder="密码" autocomplete="current-password">
+      <button id="btn-login" class="btn btn-primary login-btn">登录</button>
+      <p id="login-error" class="login-error hidden"></p>
+    </div>
+  </div>
+
   <header class="app-header">
-    <h1>🎙️ ESP32 AI Recorder <span class="subtitle">— 管理面板</span></h1>
+    <div class="header-left">
+      <h1>🎙️ ESP32 AI Recorder <span class="subtitle">— 管理面板</span></h1>
+    </div>
+    <div class="header-right">
+      <input type="text" id="search-input" class="search-input" placeholder="搜索转写内容...">
+      <button id="btn-logout" class="btn btn-secondary btn-sm" title="退出登录">🚪 退出</button>
+    </div>
   </header>
 
   <main class="app-main">
@@ -16,6 +33,7 @@
     <nav class="tab-nav">
       <button class="tab-btn active" data-tab="files">录音列表</button>
       <button class="tab-btn" data-tab="transcripts">转写记录</button>
+      <button class="tab-btn" data-tab="settings">设置</button>
       <button class="tab-btn" data-tab="status">系统状态</button>
     </nav>
 
@@ -23,7 +41,28 @@
     <section id="tab-files" class="tab-panel active">
       <div class="panel-header">
         <h2>录音列表</h2>
-        <button id="btn-refresh-files" class="btn btn-secondary" title="刷新列表">🔄 刷新</button>
+        <div class="filter-group">
+          <input type="date" id="date-from" class="date-filter" title="起始日期">
+          <span class="filter-sep">—</span>
+          <input type="date" id="date-to" class="date-filter" title="结束日期">
+          <button id="btn-refresh-files" class="btn btn-secondary" title="刷新列表">🔄 刷新</button>
+        </div>
+      </div>
+
+      <!-- 音频播放器 -->
+      <div id="audio-player-wrap" class="audio-player-wrap hidden">
+        <audio id="audio-player" controls></audio>
+        <span id="audio-player-name" class="audio-player-name"></span>
+        <button id="btn-close-player" class="btn-close" title="关闭播放器">✕</button>
+      </div>
+
+      <!-- 搜索结果 -->
+      <div id="search-results" class="search-results hidden">
+        <div class="search-results-header">
+          <h3 id="search-results-title">搜索结果</h3>
+          <button id="btn-close-search" class="btn-close" title="关闭搜索">✕</button>
+        </div>
+        <div id="search-results-list" class="search-results-list"></div>
       </div>
 
       <div class="table-wrap">
@@ -31,6 +70,7 @@
           <thead>
             <tr>
               <th>文件名</th>
+              <th>时长</th>
               <th>大小</th>
               <th>上传时间</th>
               <th>转写状态</th>
@@ -38,7 +78,7 @@
             </tr>
           </thead>
           <tbody id="files-tbody">
-            <tr><td colspan="5" class="empty-msg">加载中...</td></tr>
+            <tr><td colspan="6" class="empty-msg">加载中...</td></tr>
           </tbody>
         </table>
       </div>
@@ -102,6 +142,10 @@
       <div id="transcript-detail-panel" class="detail-panel hidden">
         <div class="detail-header">
           <h3 id="transcript-detail-title"></h3>
+          <div class="detail-header-actions">
+            <span id="transcript-edited-badge" class="badge-edited hidden">已编辑</span>
+            <span id="transcript-edited-at" class="detail-meta"></span>
+          </div>
           <button class="btn-close" id="btn-close-transcript-detail" title="关闭">✕</button>
         </div>
         <div id="transcript-detail-content" class="detail-content">
@@ -110,7 +154,59 @@
         <div id="transcript-detail-actions" class="detail-actions hidden">
           <button id="btn-download-transcript-txt" class="btn btn-secondary">📥 下载 .txt</button>
           <button id="btn-copy-transcript-txt" class="btn btn-secondary">📋 复制</button>
+          <button id="btn-edit-transcript" class="btn btn-secondary">✏️ 编辑</button>
+          <button id="btn-save-transcript" class="btn btn-primary hidden">💾 保存</button>
         </div>
+      </div>
+    </section>
+
+    <!-- ====== 设置 Tab ====== -->
+    <section id="tab-settings" class="tab-panel">
+      <div class="panel-header">
+        <h2>设置</h2>
+      </div>
+
+      <div class="settings-section">
+        <h3 class="settings-section-title">转写设置</h3>
+        <div class="settings-form">
+          <div class="settings-row">
+            <label class="settings-label" for="setting-language">转写语言</label>
+            <select id="setting-language" class="select-filter settings-control">
+              <option value="zh">中文 (zh)</option>
+              <option value="en">英文 (en)</option>
+              <option value="ja">日文 (ja)</option>
+              <option value="ko">韩文 (ko)</option>
+              <option value="auto">自动检测 (auto)</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label" for="setting-model">转写模型</label>
+            <select id="setting-model" class="select-filter settings-control"></select>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label" for="setting-auto-transcribe">自动转写</label>
+            <div class="toggle-switch">
+              <input type="checkbox" id="setting-auto-transcribe" checked>
+              <span class="toggle-slider"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3 class="settings-section-title">安全设置</h3>
+        <div class="settings-form">
+          <div class="settings-row">
+            <label class="settings-label">登录密码</label>
+            <div class="settings-control-text">
+              <p class="settings-hint">请修改 .env 文件中的 <code>AUTH_PASSWORD</code> 配置后重启服务来修改密码。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-actions">
+        <button id="btn-save-settings" class="btn btn-primary">💾 保存设置</button>
       </div>
     </section>
 
@@ -151,7 +247,7 @@
   </main>
 
   <footer class="app-footer">
-    ESP32 AI Recorder v0.3.0 &nbsp;|&nbsp; <a href="/docs" target="_blank">API 文档</a>
+    ESP32 AI Recorder v0.4.0 &nbsp;|&nbsp; <a href="/docs" target="_blank">API 文档</a>
   </footer>
 
   <!-- 删除确认对话框 -->

@@ -1,11 +1,16 @@
 /**
- * ESP32 AI Recorder — Web UI 前端交互逻辑
+ * ESP32 AI Recorder — Web UI 前端交互逻辑 v0.4
  *
  * 功能：
- * - Tab 切换
- * - 录音列表分页（AJAX /api/files）
+ * - Tab 切换（4 tabs）
+ * - 认证（自动登录 / 手动登录 / 退出）
+ * - 录音列表分页（AJAX /api/files）+ 日期筛选
  * - 转写记录列表分页（AJAX /api/transcripts）
  * - 转写结果展示（点击文件行加载详情）
+ * - 转写编辑（textarea + 保存）
+ * - 音频播放（<audio> 标签 + /stream 端点）
+ * - 全局搜索（debounce 300ms，AJAX /api/search）
+ * - 设置 Tab（加载 / 保存设置，模型列表）
  * - 系统状态自动刷新（每 10 秒轮询 /api/status）
  * - 删除确认对话框
  * - 复制转写文本到剪贴板
@@ -21,6 +26,7 @@
   var PAGE_SIZE = 20;
   var STATUS_REFRESH_INTERVAL = 10000; // 10 秒
   var PROCESSING_CHECK_INTERVAL = 5000; // 5 秒
+  var SEARCH_DEBOUNCE_MS = 300;
 
   // ================================================================
   // 状态
@@ -35,6 +41,13 @@
     deleteFileId: null,
     statusTimer: null,
     processingCheckTimer: null,
+    searchQuery: "",
+    searchTimer: null,
+    dateFrom: "",
+    dateTo: "",
+    isAuthenticated: false,
+    editMode: false,
+    currentTranscriptText: "",
   };
 
   // ================================================================
@@ -61,13 +74,14 @@
     return y + "-" + m + "-" + day + " " + h + ":" + min + ":" + s;
   }
 
-  /** 格式化时长（秒 → 分:秒） */
+  /** 格式化时长（秒 → mm:ss） */
   function formatDuration(seconds) {
     if (seconds == null || seconds === 0) return "—";
-    var m = Math.floor(seconds / 60);
-    var s = Math.floor(seconds % 60);
+    var totalSec = Math.floor(seconds);
+    var m = Math.floor(totalSec / 60);
+    var s = totalSec % 60;
     if (m > 0) {
-      return m + "m " + s + "s";
+      return m + ":" + String(s).padStart(2, "0");
     }
     return s + "s";
   }
@@ -128,6 +142,10 @@
   /** AJAX GET 请求 */
   function apiGet(url) {
     return fetch(url).then(function (res) {
+      if (res.status === 401) {
+        showLoginOverlay();
+        throw new Error("Unauthorized");
+      }
       if (!res.ok) throw new Error("HTTP " + res.status);
       return res.json();
     });
@@ -141,12 +159,97 @@
     });
   }
 
-  /** AJAX POST 请求 */
-  function apiPost(url) {
-    return fetch(url, { method: "POST" }).then(function (res) {
+  /** AJAX POST 请求（可带 body） */
+  function apiPost(url, body) {
+    var opts = { method: "POST" };
+    if (body) {
+      opts.headers = { "Content-Type": "application/json" };
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(url, opts).then(function (res) {
       if (!res.ok) throw new Error("HTTP " + res.status);
       return res.json();
     });
+  }
+
+  /** AJAX PUT 请求 */
+  function apiPut(url, body) {
+    return fetch(url, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(function (res) {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.json();
+    });
+  }
+
+  // ================================================================
+  // 认证模块
+  // ================================================================
+
+  function showLoginOverlay() {
+    state.isAuthenticated = false;
+    var overlay = document.getElementById("login-overlay");
+    if (overlay) overlay.style.display = "flex";
+  }
+
+  function hideLoginOverlay() {
+    state.isAuthenticated = true;
+    var overlay = document.getElementById("login-overlay");
+    if (overlay) overlay.style.display = "none";
+  }
+
+  function checkAuth() {
+    var savedPassword = localStorage.getItem("rec_password");
+    if (savedPassword) {
+      doLogin(savedPassword, true);
+    } else {
+      showLoginOverlay();
+    }
+  }
+
+  function doLogin(password, isAuto) {
+    apiPost("/api/auth/login", { password: password })
+      .then(function (resp) {
+        if (resp.code === 0) {
+          hideLoginOverlay();
+          localStorage.setItem("rec_password", password);
+          if (!isAuto) {
+            showToast("登录成功", "success");
+          }
+        } else {
+          if (isAuto) {
+            // 自动登录失败，显示登录界面
+            localStorage.removeItem("rec_password");
+            showLoginOverlay();
+          } else {
+            var errorEl = document.getElementById("login-error");
+            errorEl.textContent = "密码错误";
+            errorEl.classList.remove("hidden");
+          }
+        }
+      })
+      .catch(function () {
+        if (isAuto) {
+          showLoginOverlay();
+        } else {
+          showToast("登录失败", "error");
+        }
+      });
+  }
+
+  function doLogout() {
+    apiPost("/api/auth/logout")
+      .then(function () {
+        localStorage.removeItem("rec_password");
+        showLoginOverlay();
+        showToast("已退出登录", "info");
+      })
+      .catch(function () {
+        localStorage.removeItem("rec_password");
+        showLoginOverlay();
+      });
   }
 
   // ================================================================
@@ -174,6 +277,8 @@
           loadFiles();
         } else if (tab === "transcripts") {
           loadTranscripts();
+        } else if (tab === "settings") {
+          loadSettings();
         } else if (tab === "status") {
           loadStatus();
         }
@@ -192,6 +297,12 @@
       "&page_size=" +
       PAGE_SIZE +
       "&sort=upload_time&order=desc";
+
+    // 日期筛选
+    var dateFrom = document.getElementById("date-from").value;
+    var dateTo = document.getElementById("date-to").value;
+    if (dateFrom) url += "&date_from=" + encodeURIComponent(dateFrom);
+    if (dateTo) url += "&date_to=" + encodeURIComponent(dateTo);
 
     apiGet(url)
       .then(function (resp) {
@@ -213,7 +324,9 @@
         );
       })
       .catch(function (err) {
-        showToast("网络错误: " + err.message, "error");
+        if (err.message !== "Unauthorized") {
+          showToast("网络错误: " + err.message, "error");
+        }
       });
   }
 
@@ -221,7 +334,7 @@
     var tbody = document.getElementById("files-tbody");
     if (!items || items.length === 0) {
       tbody.innerHTML =
-        '<tr><td colspan="5" class="empty-msg">暂无录音文件</td></tr>';
+        '<tr><td colspan="6" class="empty-msg">暂无录音文件</td></tr>';
       return;
     }
 
@@ -244,10 +357,15 @@
         '">' +
         escapeHtml(truncate(item.filename, 30)) +
         "</td>";
+      html += "<td>" + formatDuration(item.duration) + "</td>";
       html += "<td>" + formatSize(item.file_size) + "</td>";
       html += "<td>" + formatDateTime(item.upload_time) + "</td>";
       html += "<td>" + statusBadge(transStatus) + "</td>";
       html += "<td>";
+      html +=
+        '<button class="btn-icon" title="播放" onclick="window._playFile(' +
+        item.id +
+        ')">▶</button> ';
       html +=
         '<button class="btn-icon" title="查看详情" onclick="window._viewFile(' +
         item.id +
@@ -312,10 +430,11 @@
 
         var file = fileResp.data;
         filenameEl.textContent = file.filename;
-        metaEl.textContent =
-          formatSize(file.file_size) +
-          " | " +
-          formatDateTime(file.upload_time);
+        var metaParts = [];
+        if (file.duration) metaParts.push(formatDuration(file.duration));
+        metaParts.push(formatSize(file.file_size));
+        metaParts.push(formatDateTime(file.upload_time));
+        metaEl.textContent = metaParts.join(" | ");
 
         if (transResp.code !== 0 || !transResp.data) {
           contentEl.innerHTML =
@@ -358,6 +477,30 @@
         contentEl.innerHTML =
           '<p class="empty-msg">加载失败: ' + escapeHtml(err.message) + "</p>";
       });
+  }
+
+  // ================================================================
+  // 音频播放模块
+  // ================================================================
+
+  function playFile(fileId) {
+    var audioPlayer = document.getElementById("audio-player");
+    var playerWrap = document.getElementById("audio-player-wrap");
+    var playerName = document.getElementById("audio-player-name");
+
+    audioPlayer.src = "/api/files/" + fileId + "/stream";
+    audioPlayer.load();
+    playerWrap.classList.remove("hidden");
+    playerName.textContent = "加载中...";
+
+    // 获取文件名
+    apiGet("/api/files/" + fileId).then(function (resp) {
+      if (resp.code === 0 && resp.data) {
+        playerName.textContent = resp.data.filename;
+      }
+    }).catch(function () {});
+
+    audioPlayer.play().catch(function () {});
   }
 
   // ================================================================
@@ -447,6 +590,7 @@
   /** 查看转写详情 */
   function viewTranscript(fileId) {
     state.selectedTranscriptFileId = fileId;
+    state.editMode = false;
 
     var panel = document.getElementById("transcript-detail-panel");
     panel.classList.remove("hidden");
@@ -454,12 +598,20 @@
     var titleEl = document.getElementById("transcript-detail-title");
     var contentEl = document.getElementById("transcript-detail-content");
     var actionsEl = document.getElementById("transcript-detail-actions");
+    var editBadge = document.getElementById("transcript-edited-badge");
+    var editedAtEl = document.getElementById("transcript-edited-at");
+    var btnEdit = document.getElementById("btn-edit-transcript");
+    var btnSave = document.getElementById("btn-save-transcript");
 
     contentEl.innerHTML = '<p class="empty-msg">加载中...</p>';
     actionsEl.classList.add("hidden");
+    editBadge.classList.add("hidden");
+    editedAtEl.textContent = "";
+    btnSave.classList.add("hidden");
     // Reset download/copy visibility
     document.getElementById("btn-download-transcript-txt").style.display = "";
     document.getElementById("btn-copy-transcript-txt").style.display = "";
+    btnEdit.style.display = "";
 
     Promise.all([
       apiGet("/api/files/" + fileId),
@@ -482,9 +634,26 @@
         }
 
         var trans = transResp.data;
+        state.currentTranscriptText = trans.text || "";
+
+        // 显示已编辑标记
+        if (trans.is_edited === 1) {
+          editBadge.classList.remove("hidden");
+          if (trans.edited_at) {
+            editedAtEl.textContent = "编辑于 " + formatDateTime(trans.edited_at);
+          }
+        }
 
         if (trans.status === "completed" && trans.text) {
-          contentEl.textContent = trans.text;
+          // 使用 textarea 显示转写文本（方便编辑）
+          var textarea = document.createElement("textarea");
+          textarea.id = "transcript-text-editor";
+          textarea.className = "transcript-editor";
+          textarea.value = trans.text;
+          textarea.readOnly = true;
+          contentEl.innerHTML = "";
+          contentEl.appendChild(textarea);
+
           actionsEl.classList.remove("hidden");
 
           document.getElementById(
@@ -496,8 +665,21 @@
           document.getElementById(
             "btn-copy-transcript-txt"
           ).onclick = function () {
-            copyToClipboard(trans.text);
+            copyToClipboard(textarea.value);
           };
+
+          btnEdit.onclick = function () {
+            state.editMode = true;
+            textarea.readOnly = false;
+            textarea.focus();
+            btnEdit.style.display = "none";
+            btnSave.classList.remove("hidden");
+          };
+
+          btnSave.onclick = function () {
+            saveTranscript(fileId, textarea.value);
+          };
+
         } else if (trans.status === "failed") {
           contentEl.innerHTML =
             '<p class="empty-msg" style="color:var(--color-danger)">转写失败: ' +
@@ -515,6 +697,152 @@
         contentEl.innerHTML =
           '<p class="empty-msg">加载失败: ' + escapeHtml(err.message) + "</p>";
       });
+  }
+
+  /** 保存转写编辑 */
+  function saveTranscript(fileId, text) {
+    apiPut("/api/transcripts/" + fileId, { text: text })
+      .then(function (resp) {
+        if (resp.code === 0) {
+          showToast("保存成功", "success");
+          state.editMode = false;
+          // 重新加载详情
+          viewTranscript(fileId);
+        } else {
+          showToast("保存失败: " + resp.message, "error");
+        }
+      })
+      .catch(function (err) {
+        showToast("保存失败: " + err.message, "error");
+      });
+  }
+
+  // ================================================================
+  // 设置 Tab
+  // ================================================================
+
+  function loadSettings() {
+    Promise.all([
+      apiGet("/api/settings"),
+      apiGet("/api/settings/models"),
+    ])
+      .then(function (results) {
+        var settingsResp = results[0];
+        var modelsResp = results[1];
+
+        if (settingsResp.code !== 0) return;
+        var settings = settingsResp.data;
+
+        // 语言下拉
+        var langSelect = document.getElementById("setting-language");
+        if (settings.transcribe_language) {
+          langSelect.value = settings.transcribe_language;
+        }
+
+        // 模型下拉
+        var modelSelect = document.getElementById("setting-model");
+        if (modelsResp.code === 0 && modelsResp.data) {
+          modelSelect.innerHTML = "";
+          modelsResp.data.forEach(function (model) {
+            var opt = document.createElement("option");
+            opt.value = model;
+            opt.textContent = model.split("/").pop();
+            modelSelect.appendChild(opt);
+          });
+          if (settings.transcribe_model) {
+            modelSelect.value = settings.transcribe_model;
+          }
+        }
+
+        // 自动转写开关
+        var autoToggle = document.getElementById("setting-auto-transcribe");
+        autoToggle.checked = settings.auto_transcribe !== "false";
+      })
+      .catch(function () {});
+  }
+
+  function saveSettings() {
+    var data = {
+      transcribe_language: document.getElementById("setting-language").value,
+      transcribe_model: document.getElementById("setting-model").value,
+      auto_transcribe: document.getElementById("setting-auto-transcribe").checked ? "true" : "false",
+    };
+
+    apiPut("/api/settings", data)
+      .then(function (resp) {
+        if (resp.code === 0) {
+          showToast("设置已保存", "success");
+        } else {
+          showToast("保存失败: " + resp.message, "error");
+        }
+      })
+      .catch(function (err) {
+        showToast("保存失败: " + err.message, "error");
+      });
+  }
+
+  // ================================================================
+  // 搜索模块
+  // ================================================================
+
+  function doSearch(keyword) {
+    if (!keyword || !keyword.trim()) {
+      document.getElementById("search-results").classList.add("hidden");
+      return;
+    }
+
+    apiGet("/api/search?q=" + encodeURIComponent(keyword.trim()) + "&limit=20")
+      .then(function (resp) {
+        if (resp.code !== 0) return;
+        var items = resp.data;
+        var resultsEl = document.getElementById("search-results");
+        var listEl = document.getElementById("search-results-list");
+        var titleEl = document.getElementById("search-results-title");
+
+        if (!items || items.length === 0) {
+          titleEl.textContent = "搜索结果（0 条）";
+          listEl.innerHTML = '<p class="empty-msg">未找到匹配的转写内容</p>';
+        } else {
+          titleEl.textContent = "搜索结果（" + items.length + " 条）";
+          var html = "";
+          items.forEach(function (item) {
+            // 将 **keyword** 替换为 <mark>keyword</mark>
+            var snippet = escapeHtml(item.snippet || "")
+              .replace(/\*\*/g, function () { return "§§MARK§§"; });
+            // 简单替换：将 §§MARK§§keyword§§MARK§§ 替换为 <mark>
+            snippet = snippet.replace(/§§MARK§§(.*?)§§MARK§§/g, "<mark>$1</mark>");
+
+            html += '<div class="search-result-item" onclick="window._viewFile(' + item.file_id + ')">';
+            html += '<div class="search-result-header">';
+            html += '<span class="search-result-filename">' + escapeHtml(item.filename) + '</span>';
+            html += '<span class="search-result-meta">';
+            if (item.duration) html += formatDuration(item.duration) + ' | ';
+            html += formatDateTime(item.upload_time) + '</span>';
+            html += '</div>';
+            html += '<div class="search-result-snippet">' + snippet + '</div>';
+            html += '</div>';
+          });
+          listEl.innerHTML = html;
+        }
+
+        resultsEl.classList.remove("hidden");
+      })
+      .catch(function (err) {
+        if (err.message !== "Unauthorized") {
+          showToast("搜索失败: " + err.message, "error");
+        }
+      });
+  }
+
+  function initSearch() {
+    var input = document.getElementById("search-input");
+    input.addEventListener("input", function () {
+      var val = input.value;
+      if (state.searchTimer) clearTimeout(state.searchTimer);
+      state.searchTimer = setTimeout(function () {
+        doSearch(val);
+      }, SEARCH_DEBOUNCE_MS);
+    });
   }
 
   // ================================================================
@@ -782,6 +1110,7 @@
   window._viewTranscript = viewTranscript;
   window._confirmDelete = confirmDelete;
   window._triggerTranscribe = triggerTranscribe;
+  window._playFile = playFile;
 
   // ================================================================
   // 初始化
@@ -796,12 +1125,36 @@
       window.SERVER_START_TS = Date.now() / 1000;
     }
 
+    // 认证检查
+    checkAuth();
+
     // Tab 切换
     initTabs();
 
     // 初始加载数据
     loadFiles();
     loadStatus();
+
+    // 搜索
+    initSearch();
+
+    // 登录按钮
+    document.getElementById("btn-login").addEventListener("click", function () {
+      var password = document.getElementById("login-password").value;
+      if (!password) return;
+      doLogin(password, false);
+    });
+
+    // 登录输入框回车
+    document.getElementById("login-password").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        var password = document.getElementById("login-password").value;
+        if (password) doLogin(password, false);
+      }
+    });
+
+    // 退出按钮
+    document.getElementById("btn-logout").addEventListener("click", doLogout);
 
     // 按钮事件
     document
@@ -821,6 +1174,11 @@
     document
       .getElementById("btn-refresh-status")
       .addEventListener("click", loadStatus);
+
+    // 保存设置
+    document
+      .getElementById("btn-save-settings")
+      .addEventListener("click", saveSettings);
 
     // 关闭详情面板
     document
@@ -843,6 +1201,25 @@
           .getElementById("transcript-detail-panel")
           .classList.add("hidden");
         state.selectedTranscriptFileId = null;
+        state.editMode = false;
+      });
+
+    // 关闭音频播放器
+    document
+      .getElementById("btn-close-player")
+      .addEventListener("click", function () {
+        var audioPlayer = document.getElementById("audio-player");
+        audioPlayer.pause();
+        audioPlayer.src = "";
+        document.getElementById("audio-player-wrap").classList.add("hidden");
+      });
+
+    // 关闭搜索结果
+    document
+      .getElementById("btn-close-search")
+      .addEventListener("click", function () {
+        document.getElementById("search-results").classList.add("hidden");
+        document.getElementById("search-input").value = "";
       });
 
     // 转写记录筛选
@@ -852,6 +1229,16 @@
         state.transcriptsPage = 1;
         loadTranscripts();
       });
+
+    // 日期筛选
+    document.getElementById("date-from").addEventListener("change", function () {
+      state.filesPage = 1;
+      loadFiles();
+    });
+    document.getElementById("date-to").addEventListener("change", function () {
+      state.filesPage = 1;
+      loadFiles();
+    });
 
     // 删除对话框
     document
