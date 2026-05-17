@@ -18,6 +18,8 @@ DEFAULTS: dict[str, str] = {
     "transcribe_language": "zh",
     "transcribe_model": "mlx-community/whisper-large-v3-turbo",
     "auto_transcribe": "true",
+    "cleanup_days": "90",
+    "diarize_enabled": "false",
 }
 
 

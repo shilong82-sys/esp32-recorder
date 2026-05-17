@@ -1,6 +1,6 @@
 """ESP32 AI Recorder — SQLAlchemy ORM 模型。
 
-对应数据库表 files、transcriptions 和 settings。
+对应数据库表 files、transcriptions、settings、tags、file_tags。
 """
 
 from datetime import datetime, timezone
@@ -37,6 +37,7 @@ class File(Base):
         duration: 音频时长（秒），从 WAV header 读取。
         created_at: 记录创建时间。
         transcription: 关联的转写记录（1:1）。
+        tags: 关联的标签列表（many-to-many）。
     """
 
     __tablename__ = "files"
@@ -58,6 +59,13 @@ class File(Base):
         passive_deletes=True,
     )
 
+    tags = relationship(
+        "Tag",
+        secondary="file_tags",
+        back_populates="files",
+        lazy="selectin",
+    )
+
     def __repr__(self) -> str:
         return f"<File id={self.id} filename={self.filename!r}>"
 
@@ -70,6 +78,8 @@ class Transcription(Base):
         file_id: 关联文件 ID（外键，级联删除）。
         status: 转写状态（pending/processing/completed/failed）。
         text: 转写文本。
+        segments: 时间戳分段 JSON（[{start, end, text}]）。
+        speakers: 说话人信息 JSON（[{id, name, segment_indices}]）。
         model: 使用的模型名称。
         language: 检测到的语言。
         duration: 音频时长（秒）。
@@ -98,6 +108,8 @@ class Transcription(Base):
         comment="pending/processing/completed/failed",
     )
     text = Column(Text, nullable=True, comment="转写文本")
+    segments = Column(Text, nullable=True, comment="时间戳分段 JSON")
+    speakers = Column(Text, nullable=True, comment="说话人信息 JSON")
     model = Column(String, nullable=True, comment="模型名称")
     language = Column(String, nullable=True, comment="检测到的语言")
     duration = Column(Float, nullable=True, comment="音频时长（秒）")
@@ -112,6 +124,62 @@ class Transcription(Base):
 
     def __repr__(self) -> str:
         return f"<Transcription id={self.id} file_id={self.file_id} status={self.status!r}>"
+
+
+class Tag(Base):
+    """标签。
+
+    Attributes:
+        id: 主键。
+        name: 标签名称（唯一）。
+        color: 标签颜色（hex 格式）。
+        created_at: 创建时间。
+        files: 关联的文件列表（many-to-many）。
+    """
+
+    __tablename__ = "tags"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False, unique=True, comment="标签名称")
+    color = Column(String, default="#6366f1", comment="标签颜色 hex")
+    created_at = Column(DateTime, default=_utcnow, comment="创建时间")
+
+    files = relationship(
+        "File",
+        secondary="file_tags",
+        back_populates="tags",
+        lazy="dynamic",
+    )
+
+    def __repr__(self) -> str:
+        return f"<Tag id={self.id} name={self.name!r}>"
+
+
+class FileTag(Base):
+    """文件-标签关联表。
+
+    Attributes:
+        file_id: 文件 ID（外键，级联删除）。
+        tag_id: 标签 ID（外键，级联删除）。
+    """
+
+    __tablename__ = "file_tags"
+
+    file_id = Column(
+        Integer,
+        ForeignKey("files.id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="文件 ID",
+    )
+    tag_id = Column(
+        Integer,
+        ForeignKey("tags.id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="标签 ID",
+    )
+
+    def __repr__(self) -> str:
+        return f"<FileTag file_id={self.file_id} tag_id={self.tag_id}>"
 
 
 class Setting(Base):

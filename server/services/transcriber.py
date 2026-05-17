@@ -7,11 +7,14 @@ asyncio.Queue + 单 worker 后台转写，支持：
 - 转写结果写文件 transcripts/{saved_name}.txt
 - 启动时自动处理 pending 记录 + 修复 stuck processing
 - 从 settings 表读取语言和模型配置
+- 提取 segments 并写入数据库
+- 说话人分离（pyannote-audio，可选）
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -72,14 +75,15 @@ class Transcriber:
                 pass
         logger.info("Transcriber stopped")
 
-    async def enqueue(self, file_id: int) -> None:
+    async def enqueue(self, file_id: int, model: Optional[str] = None) -> None:
         """将文件加入转写队列。
 
         Args:
             file_id: 文件 ID。
+            model: 可选的模型名称（重新转写时指定）。
         """
         await self._queue.put(file_id)
-        logger.info("Enqueued file_id=%d for transcription", file_id)
+        logger.info("Enqueued file_id=%d for transcription (model=%s)", file_id, model or "default")
 
     def queue_size(self) -> int:
         """获取当前队列大小。"""
@@ -161,12 +165,13 @@ class Transcriber:
     # 转写处理
     # ------------------------------------------------------------------
 
-    async def _process_file(self, file_id: int, attempt: int = 1) -> None:
+    async def _process_file(self, file_id: int, attempt: int = 1, model_override: Optional[str] = None) -> None:
         """处理单个文件的转写。
 
         Args:
             file_id: 文件 ID。
             attempt: 当前尝试次数（1=首次，2=重试）。
+            model_override: 可选的模型名称覆盖。
         """
         from ..database import _async_session_factory
 
@@ -204,7 +209,7 @@ class Transcriber:
 
             # 从 settings 表读取语言和模型配置
             language = await get_setting("transcribe_language", "zh")
-            model = await get_setting("transcribe_model", config.whisper_model)
+            model = model_override or await get_setting("transcribe_model", config.whisper_model)
 
             # 更新状态为 processing
             db_trans.status = "processing"
@@ -233,6 +238,40 @@ class Transcriber:
             text = result.get("text", "")
             detected_language = result.get("language")
             duration = result.get("duration")
+            raw_segments = result.get("segments")
+
+            # 提取 segments 列表
+            segments_json: Optional[str] = None
+            if raw_segments:
+                clean_segments = []
+                for seg in raw_segments:
+                    clean_segments.append({
+                        "start": round(float(seg.get("start", 0.0)), 3),
+                        "end": round(float(seg.get("end", 0.0)), 3),
+                        "text": str(seg.get("text", "")).strip(),
+                    })
+                segments_json = json.dumps(clean_segments, ensure_ascii=False)
+
+            # 说话人分离
+            speakers_json: Optional[str] = None
+            diarize_enabled = await get_setting("diarize_enabled", "false")
+            if diarize_enabled.lower() == "true" and segments_json:
+                try:
+                    from ..services.diarizer import diarize, align_speakers_segments, is_available
+                    if is_available():
+                        speaker_segments = await diarize(audio_path)
+                        if speaker_segments and clean_segments:
+                            speakers = align_speakers_segments(speaker_segments, clean_segments)
+                            if speakers:
+                                speakers_json = json.dumps(speakers, ensure_ascii=False)
+                                logger.info(
+                                    "Diarization completed: file_id=%d speakers=%d",
+                                    file_id, len(speakers),
+                                )
+                    else:
+                        logger.info("pyannote-audio not available, skipping diarization for file_id=%d", file_id)
+                except Exception as exc:
+                    logger.warning("Diarization error for file_id=%d: %s", file_id, exc)
 
             async with _async_session_factory() as session:
                 trans_result = await session.execute(
@@ -242,6 +281,8 @@ class Transcriber:
                 if db_trans is not None:
                     db_trans.status = "completed"
                     db_trans.text = text
+                    db_trans.segments = segments_json
+                    db_trans.speakers = speakers_json
                     # 写入实际使用的语言：如果指定了语言则用指定的，否则用检测到的
                     db_trans.language = whisper_language or detected_language
                     db_trans.duration = duration
@@ -252,8 +293,10 @@ class Transcriber:
             await asyncio.to_thread(self._write_transcript_file, saved_name, text)
 
             logger.info(
-                "Transcription completed: file_id=%d lang=%s duration=%.1fs",
+                "Transcription completed: file_id=%d lang=%s duration=%.1fs segments=%d speakers=%s",
                 file_id, whisper_language or detected_language, duration or 0,
+                len(raw_segments) if raw_segments else 0,
+                "yes" if speakers_json else "no",
             )
 
         except asyncio.TimeoutError:
@@ -338,7 +381,7 @@ class Transcriber:
             language: 转写语言，None 时由 mlx-whisper 自动检测。
 
         Returns:
-            转写结果字典，包含 text, language, duration 等字段。
+            转写结果字典，包含 text, language, duration, segments 等字段。
         """
         import mlx_whisper
 

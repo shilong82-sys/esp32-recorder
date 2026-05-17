@@ -1,6 +1,6 @@
 """ESP32 AI Recorder — 文件管理路由。
 
-GET    /api/files              — 文件列表（分页+排序+过滤）
+GET    /api/files              — 文件列表（分页+排序+过滤+标签筛选）
 GET    /api/files/{file_id}    — 文件详情
 DELETE /api/files/{file_id}    — 删除文件及关联转写
 GET    /api/files/{file_id}/download  — 下载 WAV 文件
@@ -20,13 +20,14 @@ from sqlalchemy.orm import selectinload
 
 from ..config import get_config
 from ..database import get_session
-from ..models import File, Transcription
+from ..models import File, FileTag, Tag, Transcription
 from ..schemas import (
     ApiResponse,
     ErrorCode,
     FileItem,
     FileListData,
     FileListItem,
+    TagItem,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,21 @@ CHUNK_SIZE = 1024 * 1024
 # 辅助函数
 # ---------------------------------------------------------------------------
 
+def _build_tag_items(db_file: File) -> Optional[list[TagItem]]:
+    """从 File ORM 对象提取标签列表。"""
+    if not db_file.tags:
+        return None
+    return [
+        TagItem(
+            id=t.id,
+            name=t.name,
+            color=t.color,
+            created_at=t.created_at,
+        )
+        for t in db_file.tags
+    ]
+
+
 def _file_to_item(db_file: File) -> FileListItem:
     """将 ORM File 对象转换为 FileListItem schema。"""
     transcription = None
@@ -50,6 +66,8 @@ def _file_to_item(db_file: File) -> FileListItem:
             "id": t.id,
             "file_id": t.file_id,
             "status": t.status,
+            "segments": t.segments,
+            "speakers": t.speakers,
             "model": t.model,
             "language": t.language,
             "duration": t.duration,
@@ -70,6 +88,7 @@ def _file_to_item(db_file: File) -> FileListItem:
         duration=db_file.duration,
         created_at=db_file.created_at,
         transcription=transcription,
+        tags=_build_tag_items(db_file),
     )
 
 
@@ -83,6 +102,8 @@ def _file_to_detail(db_file: File) -> FileItem:
             "file_id": t.file_id,
             "status": t.status,
             "text": t.text,
+            "segments": t.segments,
+            "speakers": t.speakers,
             "model": t.model,
             "language": t.language,
             "duration": t.duration,
@@ -103,6 +124,7 @@ def _file_to_detail(db_file: File) -> FileItem:
         duration=db_file.duration,
         created_at=db_file.created_at,
         transcription=transcription,
+        tags=_build_tag_items(db_file),
     )
 
 
@@ -172,11 +194,12 @@ async def list_files(
     transcription_status: Optional[str] = Query(
         None, description="转写状态过滤: pending/processing/completed/failed"
     ),
+    tag_id: Optional[int] = Query(None, description="按标签 ID 筛选"),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse:
-    """获取文件列表（分页、排序、过滤）。"""
+    """获取文件列表（分页、排序、过滤、标签筛选）。"""
     # 基础查询
-    query = select(File).options(selectinload(File.transcription))
+    query = select(File).options(selectinload(File.transcription), selectinload(File.tags))
     count_query = select(func.count(File.id))
 
     # 过滤条件
@@ -212,6 +235,15 @@ async def list_files(
         )
         count_query = count_query.join(File.transcription).where(
             Transcription.status == transcription_status
+        )
+
+    # 按标签筛选
+    if tag_id is not None:
+        query = query.join(FileTag, File.id == FileTag.file_id).where(
+            FileTag.tag_id == tag_id
+        )
+        count_query = count_query.join(FileTag, File.id == FileTag.file_id).where(
+            FileTag.tag_id == tag_id
         )
 
     # 排序
@@ -259,7 +291,8 @@ async def get_file(
 ) -> ApiResponse:
     """获取文件详情。"""
     query = select(File).where(File.id == file_id).options(
-        selectinload(File.transcription)
+        selectinload(File.transcription),
+        selectinload(File.tags),
     )
     result = await session.execute(query)
     db_file = result.scalar_one_or_none()
@@ -279,11 +312,12 @@ async def delete_file(
     file_id: int,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse:
-    """删除文件及关联转写记录。"""
+    """删除文件及关联转写记录和标签关联。"""
     config = get_config()
 
     query = select(File).where(File.id == file_id).options(
-        selectinload(File.transcription)
+        selectinload(File.transcription),
+        selectinload(File.tags),
     )
     result = await session.execute(query)
     db_file = result.scalar_one_or_none()
@@ -315,7 +349,7 @@ async def delete_file(
             except OSError as exc:
                 logger.warning("Failed to delete transcript %s: %s", txt_path, exc)
 
-    # 删除数据库记录（级联删除 transcription）
+    # 删除数据库记录（级联删除 transcription 和 file_tags）
     await session.delete(db_file)
 
     logger.info("Deleted file record: id=%d filename=%s", file_id, db_file.filename)

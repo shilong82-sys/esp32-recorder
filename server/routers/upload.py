@@ -1,13 +1,14 @@
 """ESP32 AI Recorder — 上传路由。
 
-POST /upload — RAW BODY 流式接收 WAV 文件，兼容现有固件。
+POST /upload     — RAW BODY 流式接收 WAV 文件，兼容现有固件
+POST /upload/web — multipart/form-data 上传，支持 Web 拖拽上传
 """
 
 import logging
 import os
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, UploadFile, File as FastAPIFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_config
@@ -170,6 +171,109 @@ async def handle_upload(
     logger.info(
         "File received: %s (%d bytes, src=%s, duration=%ss) -> id=%d",
         saved_name, file_size, client_ip,
+        f"{duration:.1f}" if duration else "unknown",
+        db_file.id,
+    )
+
+    return ApiResponse(
+        data=UploadResponseData(
+            file_id=db_file.id,
+            filename=filename,
+            saved_name=saved_name,
+            file_size=file_size,
+        ).model_dump(),
+    )
+
+
+@router.post("/upload/web", response_model=ApiResponse)
+async def handle_web_upload(
+    file: UploadFile = FastAPIFile(..., description="WAV 文件"),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse:
+    """Web 端 multipart/form-data 上传（支持拖拽上传）。
+
+    与固件端 /upload（raw body）共存，互不干扰。
+    """
+    config = get_config()
+
+    # 确保存储目录存在
+    os.makedirs(config.received_dir, exist_ok=True)
+
+    # 解析文件名
+    filename = file.filename or f"REC_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.wav"
+    saved_name = _resolve_conflict_filename(filename, config.received_dir)
+
+    # 写入文件
+    file_path = os.path.join(config.received_dir, saved_name)
+    file_size = 0
+    max_bytes = config.max_file_size_mb * 1024 * 1024
+
+    try:
+        with open(file_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1MB chunks
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                if file_size > max_bytes:
+                    os.remove(file_path)
+                    logger.warning(
+                        "Web upload rejected: file too large (%d > %d bytes)",
+                        file_size, max_bytes,
+                    )
+                    return ApiResponse(
+                        code=ErrorCode.BAD_REQUEST,
+                        message=f"File too large (max {config.max_file_size_mb}MB)",
+                        data=None,
+                    )
+                f.write(chunk)
+    except Exception as exc:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        logger.error("Failed to save web uploaded file: %s", exc)
+        return ApiResponse(
+            code=ErrorCode.INTERNAL_ERROR,
+            message="Failed to save file",
+            data=None,
+        )
+
+    # 从 WAV header 读取音频时长
+    duration = read_wav_duration(file_path)
+    if duration is not None:
+        logger.info("WAV duration: %.1fs for %s", duration, saved_name)
+
+    # 创建数据库记录
+    upload_time = datetime.now(timezone.utc)
+    db_file = File(
+        filename=filename,
+        saved_name=saved_name,
+        file_size=file_size,
+        upload_time=upload_time,
+        upload_src="web",
+        duration=duration,
+    )
+    session.add(db_file)
+    await session.flush()
+
+    # 创建待转写记录
+    db_transcription = Transcription(
+        file_id=db_file.id,
+        status="pending",
+    )
+    session.add(db_transcription)
+    await session.flush()
+
+    # 读取 auto_transcribe 设置，判断是否自动入队转写
+    auto_transcribe = await get_setting("auto_transcribe", "true")
+    if auto_transcribe.lower() != "false":
+        await enqueue(db_file.id)
+        logger.info("Auto-transcribe enabled, enqueued file_id=%d (web upload)", db_file.id)
+    else:
+        logger.info("Auto-transcribe disabled, skipping enqueue for file_id=%d (web upload)", db_file.id)
+
+    logger.info(
+        "Web upload received: %s (%d bytes, duration=%ss) -> id=%d",
+        saved_name, file_size,
         f"{duration:.1f}" if duration else "unknown",
         db_file.id,
     )

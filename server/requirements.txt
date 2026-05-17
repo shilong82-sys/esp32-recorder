@@ -6,3 +6,5 @@ jinja2>=3.1.0
 python-multipart>=0.0.12
 mlx-whisper>=0.4.0
 itsdangerous>=2.1.0
+# 说话人分离（可选，需配置 HF_TOKEN）
+# pyannote-audio>=3.1.0

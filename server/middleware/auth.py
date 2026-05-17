@@ -21,6 +21,7 @@ EXEMPT_PATHS: tuple[str, ...] = (
     "/upload",
     "/api/auth/login",
     "/api/auth/logout",
+    "/api/backup/export",
     "/static/",
     "/docs",
     "/openapi.json",

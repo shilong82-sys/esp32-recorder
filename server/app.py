@@ -1,6 +1,6 @@
 """ESP32 AI Recorder — FastAPI 入口。
 
-挂载所有路由，管理应用生命周期（启动时初始化数据库、索引文件、启动转写 worker）。
+挂载所有路由，管理应用生命周期（启动时初始化数据库、索引文件、启动转写 worker、启动清理服务）。
 """
 
 import logging
@@ -18,7 +18,8 @@ from fastapi.templating import Jinja2Templates
 from .config import get_config
 from .database import close_db, init_db
 from .middleware.auth import AuthMiddleware
-from .routers import auth, files, search, settings, status, transcripts, upload
+from .routers import auth, backup, batch, files, search, settings, status, tags, transcripts, upload
+from .services.cleanup import get_cleanup_service
 from .services.file_indexer import index_received_dir
 from .services.settings_service import init_default_settings
 from .services.transcriber import get_transcriber
@@ -48,6 +49,7 @@ async def lifespan(app: FastAPI):
     3. 索引 received/ 目录
     4. 初始化默认设置
     5. 启动转写 worker
+    6. 启动清理服务
     """
     global _server_start_time
     config = get_config()
@@ -73,6 +75,11 @@ async def lifespan(app: FastAPI):
     await transcriber.start()
     logger.info("Transcriber worker started")
 
+    # 启动清理服务
+    cleanup_service = get_cleanup_service()
+    await cleanup_service.start()
+    logger.info("Cleanup service started")
+
     # 记录服务启动时间
     _server_start_time = datetime.now(timezone.utc).isoformat()
 
@@ -82,6 +89,10 @@ async def lifespan(app: FastAPI):
     )
 
     yield  # 应用运行中
+
+    # 停止清理服务
+    await cleanup_service.stop()
+    logger.info("Cleanup service stopped")
 
     # 停止转写 worker
     await transcriber.stop()
@@ -97,18 +108,22 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="ESP32 AI Recorder",
         description="录音管理 + AI 转写平台",
-        version="0.4.0",
+        version="0.5.0",
         lifespan=lifespan,
     )
 
-    # 挂载路由
+    # 挂载路由（注意：batch 必须在 transcripts 之前，否则 /api/transcribe/batch 会被
+    # /api/transcribe/{file_id} 路径参数路由抢先匹配，导致 422 错误）
     app.include_router(upload.router, tags=["upload"])
     app.include_router(files.router, tags=["files"])
+    app.include_router(batch.router, tags=["batch"])
     app.include_router(transcripts.router, tags=["transcripts"])
     app.include_router(status.router, tags=["status"])
     app.include_router(auth.router, tags=["auth"])
     app.include_router(settings.router, tags=["settings"])
     app.include_router(search.router, tags=["search"])
+    app.include_router(tags.router, tags=["tags"])
+    app.include_router(backup.router, tags=["backup"])
 
     # 挂载静态文件（CSS、JS 等）
     static_dir = BASE_DIR / "static"

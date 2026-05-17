@@ -4,6 +4,7 @@
 """
 
 from datetime import datetime
+from enum import Enum
 from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -31,6 +32,28 @@ class ApiResponse(BaseModel):
 # 转写相关
 # ---------------------------------------------------------------------------
 
+class SegmentItem(BaseModel):
+    """转写时间戳分段条目。"""
+
+    start: float
+    end: float
+    text: str
+
+
+class SpeakerItem(BaseModel):
+    """说话人信息条目。"""
+
+    id: str
+    name: str
+    segment_indices: List[int] = []
+
+
+class SpeakersUpdateRequest(BaseModel):
+    """说话人更新请求体。"""
+
+    speakers: List[SpeakerItem]
+
+
 class TranscriptItem(BaseModel):
     """转写记录详情。"""
 
@@ -40,6 +63,8 @@ class TranscriptItem(BaseModel):
     file_id: int
     status: str
     text: Optional[str] = None
+    segments: Optional[str] = None
+    speakers: Optional[str] = None
     model: Optional[str] = None
     language: Optional[str] = None
     duration: Optional[float] = None
@@ -59,6 +84,8 @@ class TranscriptListItem(BaseModel):
     id: int
     file_id: int
     status: str
+    segments: Optional[str] = None
+    speakers: Optional[str] = None
     model: Optional[str] = None
     language: Optional[str] = None
     duration: Optional[float] = None
@@ -86,6 +113,61 @@ class TranscriptEditRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 导出格式
+# ---------------------------------------------------------------------------
+
+class ExportFormat(str, Enum):
+    """导出格式枚举。"""
+
+    txt = "txt"
+    srt = "srt"
+    vtt = "vtt"
+
+
+# ---------------------------------------------------------------------------
+# 批量操作
+# ---------------------------------------------------------------------------
+
+class BatchDeleteRequest(BaseModel):
+    """批量删除请求体。"""
+
+    file_ids: List[int]
+
+
+class BatchTranscribeRequest(BaseModel):
+    """批量转写请求体。"""
+
+    file_ids: List[int]
+    model: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# 标签相关
+# ---------------------------------------------------------------------------
+
+class TagItem(BaseModel):
+    """标签条目。"""
+
+    id: int
+    name: str
+    color: str
+    created_at: Optional[datetime] = None
+
+
+class TagCreateRequest(BaseModel):
+    """创建标签请求体。"""
+
+    name: str
+    color: Optional[str] = None
+
+
+class FileTagRequest(BaseModel):
+    """文件标签关联请求体。"""
+
+    tag_ids: List[int]
+
+
+# ---------------------------------------------------------------------------
 # 文件相关
 # ---------------------------------------------------------------------------
 
@@ -103,6 +185,7 @@ class FileItem(BaseModel):
     duration: Optional[float] = None
     created_at: datetime
     transcription: Optional[TranscriptItem] = None
+    tags: Optional[List[TagItem]] = None
 
 
 class FileListItem(BaseModel):
@@ -119,6 +202,7 @@ class FileListItem(BaseModel):
     duration: Optional[float] = None
     created_at: datetime
     transcription: Optional[TranscriptListItem] = None
+    tags: Optional[List[TagItem]] = None
 
 
 class FileListData(BaseModel):
@@ -204,3 +288,5 @@ class ErrorCode:
     FILE_NOT_FOUND = 40401
     TRANSCRIPTION_NOT_FOUND = 40402
     TRANSCRIPTION_IN_PROGRESS = 40901
+    TAG_NOT_FOUND = 40403
+    TAG_ALREADY_EXISTS = 40902
